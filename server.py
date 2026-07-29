@@ -407,7 +407,7 @@ def top_assets(intervalo: str = "5min", _tok: str = Depends(_verificar_token)):
     Cache de 60 s para no saturar Twelve Data."""
     ahora_ts = datetime.now().timestamp()
     cached = _scanner_cache.get(intervalo)
-    if cached and ahora_ts - cached["ts"] < 60:
+    if cached and ahora_ts - cached["ts"] < 30:
         return JSONResponse({"status": "success", "cached": True, "top_assets": cached["data"]})
 
     resultados = []
@@ -744,6 +744,72 @@ async def index():
     }
     .motivo-txt { font-size: 11px; color: rgba(148,163,184,.55); margin-top: 12px; line-height: 1.55; border-top: 1px solid rgba(255,255,255,.06); padding-top: 10px; }
 
+    /* ══ SCANNER HOME ══ */
+    .home-hdr { display:flex; justify-content:space-between; align-items:center;
+      padding:12px 0 14px; margin-bottom:4px; border-bottom:1px solid rgba(255,255,255,.06); }
+    .home-hdr-title { font-family:'Orbitron',sans-serif; font-size:10px; color:var(--purple);
+      font-weight:700; letter-spacing:.5px; }
+    .home-refresh-info { font-size:9px; color:var(--muted); margin-top:3px; }
+    .time-toggle { display:flex; border-radius:8px; overflow:hidden;
+      border:1px solid rgba(255,255,255,.1); flex-shrink:0; }
+    .time-toggle-btn { padding:5px 13px; font-size:11px; font-weight:600; border:none;
+      cursor:pointer; background:transparent; color:rgba(148,163,184,.55); transition:all .15s; }
+    .time-toggle-btn.active { background:var(--purple); color:#fff; }
+
+    /* Best opp — señal confirmada */
+    .boc-wrap { border-radius:15px; overflow:hidden; margin-bottom:14px; }
+    .boc-wrap.call { background:linear-gradient(135deg,rgba(34,197,94,.1),rgba(34,197,94,.04));
+      border:1.5px solid rgba(34,197,94,.35); }
+    .boc-wrap.put  { background:linear-gradient(135deg,rgba(239,68,68,.1),rgba(239,68,68,.04));
+      border:1.5px solid rgba(239,68,68,.35); }
+    .boc-lbl { font-size:9px; font-weight:700; letter-spacing:1.2px; color:var(--muted);
+      padding:12px 14px 0; }
+    .boc-dir { font-family:'Orbitron',sans-serif; font-size:18px; font-weight:900;
+      padding:4px 14px 0; line-height:1.2; }
+    .boc-dir.call { color:#4ade80; } .boc-dir.put { color:#f87171; }
+    .boc-meta { padding:6px 14px; display:flex; gap:10px; font-size:11px; color:var(--muted); }
+    .boc-conf { font-weight:700; }
+    .boc-conf.call { color:#4ade80; } .boc-conf.put { color:#f87171; }
+    .boc-reason { padding:0 14px 10px; font-size:11px; color:rgba(148,163,184,.65); line-height:1.5; }
+    .btn-ver-senal { display:block; margin:0 14px 14px; padding:13px; border-radius:11px; border:none;
+      font-size:13px; font-weight:800; cursor:pointer; color:#fff; transition:opacity .15s; }
+    .btn-ver-senal.call { background:linear-gradient(135deg,#15803d,#22c55e);
+      box-shadow:0 0 20px rgba(34,197,94,.3); }
+    .btn-ver-senal.put  { background:linear-gradient(135deg,#b91c1c,#ef4444);
+      box-shadow:0 0 20px rgba(239,68,68,.3); }
+    .btn-ver-senal:hover { opacity:.86; }
+
+    /* Best opp — esperando */
+    .bow-wrap { padding:16px 18px; border-radius:15px; margin-bottom:14px; text-align:center;
+      background:rgba(148,163,184,.04); border:1px solid rgba(148,163,184,.14); }
+    .bow-icon { font-size:26px; margin-bottom:6px; }
+    .bow-title { font-family:'Orbitron',sans-serif; font-size:10px; color:var(--muted);
+      font-weight:700; letter-spacing:.5px; margin-bottom:5px; }
+    .bow-sub { font-size:11px; color:rgba(148,163,184,.5); line-height:1.6; }
+
+    /* Home pill (activos lista) */
+    .home-pill { display:flex; align-items:center; justify-content:space-between;
+      padding:12px 14px; border-radius:12px; margin-bottom:7px;
+      background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.07);
+      cursor:pointer; transition:background .15s,border-color .15s,transform .1s; }
+    .home-pill:hover  { background:rgba(168,85,247,.08); border-color:rgba(168,85,247,.28); }
+    .home-pill:active { transform:scale(.98); }
+    .hp-left  { flex:1; min-width:0; }
+    .hp-symbol { font-size:14px; font-weight:800; color:#e2e8f0; letter-spacing:.3px; }
+    .hp-reason { font-size:10px; color:var(--muted); margin-top:2px;
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:200px; }
+    .hp-right { text-align:right; flex-shrink:0; margin-left:10px; }
+    .hp-badge { font-size:12px; font-weight:800; padding:3px 9px; border-radius:7px;
+      display:inline-block; margin-bottom:3px; }
+    .hp-badge.call { background:rgba(34,197,94,.13); color:#4ade80; border:1px solid rgba(34,197,94,.28); }
+    .hp-badge.put  { background:rgba(239,68,68,.13);  color:#f87171; border:1px solid rgba(239,68,68,.28); }
+    .hp-badge.wait { background:rgba(234,179,8,.12);  color:#fbbf24; border:1px solid rgba(234,179,8,.25); }
+    .hp-badge.flat { background:rgba(148,163,184,.07); color:rgba(148,163,184,.55); border:1px solid rgba(148,163,184,.18); }
+    .hp-label { font-size:9px; color:var(--muted); }
+    .home-loading-wrap { text-align:center; padding:32px 0 16px; }
+    .home-loading-wrap .spinner { margin:0 auto 12px; }
+    .home-loading-wrap div { font-size:11px; color:var(--muted); }
+
     /* ══ MÓDULO ESCÁNER DE ACTIVOS ══ */
     .scanner-module {
       margin-bottom: 16px; border-radius: 14px; overflow: hidden;
@@ -999,57 +1065,39 @@ async def index():
     <!-- ══ TAB 1: BOT IA ══ -->
     <div id="tab-bot" class="tab-pane">
 
-      <!-- Sub-pantalla: config -->
-      <div id="scanner-config" class="scanner-screen active">
+      <!-- Sub-pantalla: SCANNER HOME (pantalla principal automática) -->
+      <div id="scanner-home" class="scanner-screen active">
 
-        <!-- ══ MÓDULO ESCÁNER DE MEJORES ACTIVOS ══ -->
-        <div class="scanner-module">
-          <div class="scanner-module-header">
-            <div class="scanner-module-title">🔥 ACTIVOS RECOMENDADOS</div>
-            <button class="btn-scan" id="btn-scan" onclick="scanTopAssets()">🔍 Escanear</button>
+        <!-- Header: título + toggle temporalidad + contador -->
+        <div class="home-hdr">
+          <div>
+            <div class="home-hdr-title">📡 ESCÁNER EN VIVO</div>
+            <div class="home-refresh-info" id="home-refresh-info">Cargando...</div>
           </div>
-          <div id="asset-list-wrap" style="display:none">
-            <div id="scan-loading-txt" class="scan-loading-txt" style="display:none">
-              ⏳ Analizando mercado completo...
-            </div>
-            <div class="asset-list" id="asset-list"></div>
-            <div class="scan-cache-note" id="scan-cache-note"></div>
+          <div class="time-toggle">
+            <button class="time-toggle-btn active" id="home-btn-m5" onclick="setHomeTime('M5')">M5</button>
+            <button class="time-toggle-btn" id="home-btn-m1" onclick="setHomeTime('M1')">M1</button>
           </div>
         </div>
 
-        <div class="form-group">
-          <label>Mercado</label>
-          <select id="market-select">
-            <option value="EUR/USD">EUR / USD</option>
-            <option value="GBP/USD">GBP / USD</option>
-            <option value="USD/JPY">USD / JPY</option>
-            <option value="AUD/USD">AUD / USD</option>
-            <option value="USD/CHF">USD / CHF</option>
-            <option value="EUR/GBP">EUR / GBP</option>
-            <option value="EUR/JPY">EUR / JPY</option>
-            <option value="GBP/JPY">GBP / JPY</option>
-            <option value="AUD/JPY">AUD / JPY</option>
-            <option value="CAD/JPY">CAD / JPY</option>
-            <option value="EUR/AUD">EUR / AUD</option>
-            <option value="EUR/CHF">EUR / CHF</option>
-            <option value="GBP/CHF">GBP / CHF</option>
-          </select>
+        <!-- 🔥 MEJOR OPORTUNIDAD ACTUAL (se rellena dinámicamente) -->
+        <div id="home-best-opp"></div>
+
+        <!-- Spinner mientras carga -->
+        <div class="home-loading-wrap" id="home-loading">
+          <div class="spinner"></div>
+          <div>Escaneando los 10 pares principales...</div>
         </div>
-        <div class="form-group">
-          <label>Temporalidad</label>
-          <select id="time-select">
-            <option value="M1">1 Minuto (M1)</option>
-            <option value="M5" selected>5 Minutos (M5)</option>
-          </select>
-        </div>
-        <button class="btn btn-primary" onclick="startAnalysis()">⚡ Analizar Mercado</button>
+
+        <!-- Lista de todos los activos -->
+        <div id="home-asset-list" style="display:none"></div>
+
         <div class="disclaimer" style="margin-top:14px;">
-          Análisis técnico generado en tiempo real sobre mercado Forex oficial.
-          La operativa en pares OTC queda a criterio del usuario.
+          Análisis técnico en tiempo real · Mercado Forex oficial · Actualización cada 30 s.
         </div>
       </div>
 
-      <!-- Sub-pantalla: resultado -->
+      <!-- Sub-pantalla: resultado del análisis individual -->
       <div id="scanner-signal" class="scanner-screen">
         <div id="loading-wrap" class="spinner-wrap">
           <div class="spinner"></div>
@@ -1121,7 +1169,7 @@ async def index():
 
         <div id="error-msg" class="error-msg"></div>
 
-        <button class="btn btn-secondary" style="margin-top:18px" onclick="backToConfig()">← Nuevo análisis</button>
+        <button class="btn btn-secondary" style="margin-top:18px" onclick="backToHome()">← Volver al escáner</button>
 
         <div class="disclaimer">
           Análisis técnico generado en tiempo real sobre mercado Forex oficial.
@@ -1476,6 +1524,7 @@ async def index():
     document.getElementById('screen-login').classList.remove('active');
     document.getElementById('bottom-nav').classList.add('visible');
     switchTab('bot');
+    startScannerHome();
   }
 
   function showLogin(msg) {
@@ -1513,13 +1562,13 @@ async def index():
 
   /* ── Scanner sub-pantallas ── */
   function showScanner(id) {
-    ['scanner-config', 'scanner-signal'].forEach(s => {
+    ['scanner-home', 'scanner-signal'].forEach(s => {
       document.getElementById(s).classList.toggle('active', s === id);
     });
   }
-  function backToConfig() {
+  function backToHome() {
     resetSignal();
-    showScanner('scanner-config');
+    showScanner('scanner-home');
   }
   function resetSignal() {
     document.getElementById('loading-wrap').style.display = 'flex';
@@ -1529,10 +1578,9 @@ async def index():
     document.getElementById('conf-bar').style.width       = '0%';
   }
 
-  /* ── Análisis on-demand ── */
-  async function startAnalysis() {
-    const symbol       = document.getElementById('market-select').value;
-    const temporalidad = document.getElementById('time-select').value;
+  /* ── Análisis on-demand (desde home o desde cualquier activo) ── */
+  async function startAnalysis(symbol, temporalidad) {
+    if (!symbol || !temporalidad) return;
     resetSignal();
     showScanner('scanner-signal');
     try {
@@ -1622,22 +1670,51 @@ async def index():
     document.getElementById('wait-card').style.display = 'block';
   }
 
-  /* ── Escáner de mejores activos ── */
-  async function scanTopAssets() {
-    const tempSel  = document.getElementById('time-select').value;
-    const intervalo = tempSel === 'M1' ? '1min' : '5min';
-    const btn      = document.getElementById('btn-scan');
-    const wrap     = document.getElementById('asset-list-wrap');
-    const loadTxt  = document.getElementById('scan-loading-txt');
-    const listEl   = document.getElementById('asset-list');
-    const noteEl   = document.getElementById('scan-cache-note');
+  /* ══ SCANNER-FIRST: escáner automático en tiempo real ══ */
+  let _homeTime      = 'M5';      // temporalidad activa en el home
+  let _homeTimer     = null;      // setInterval del auto-refresh (30 s)
+  let _homeCountdown = null;      // setInterval del contador visual
+  let _homeNextScan  = 0;         // timestamp del próximo escaneo
 
-    btn.disabled    = true;
-    btn.textContent = '⏳ Analizando...';
-    wrap.style.display   = 'block';
-    loadTxt.style.display = 'block';
-    listEl.innerHTML     = '';
-    noteEl.textContent   = '';
+  function setHomeTime(t) {
+    _homeTime = t;
+    document.getElementById('home-btn-m5').classList.toggle('active', t === 'M5');
+    document.getElementById('home-btn-m1').classList.toggle('active', t === 'M1');
+    // Escanear de inmediato con la nueva temporalidad
+    _stopHomeTimers();
+    scanHome();
+  }
+
+  function startScannerHome() {
+    _stopHomeTimers();
+    scanHome();
+    // Auto-refresh cada 30 s
+    _homeTimer = setInterval(scanHome, 30000);
+  }
+
+  function _stopHomeTimers() {
+    if (_homeTimer)     { clearInterval(_homeTimer);     _homeTimer = null; }
+    if (_homeCountdown) { clearInterval(_homeCountdown); _homeCountdown = null; }
+  }
+
+  function _startCountdown() {
+    _homeNextScan = Date.now() + 30000;
+    if (_homeCountdown) clearInterval(_homeCountdown);
+    _homeCountdown = setInterval(() => {
+      const secs = Math.max(0, Math.round((_homeNextScan - Date.now()) / 1000));
+      const el = document.getElementById('home-refresh-info');
+      if (el) el.textContent = 'Actualiza en ' + secs + ' s · ' + _homeTime;
+      if (secs === 0) clearInterval(_homeCountdown);
+    }, 1000);
+  }
+
+  async function scanHome() {
+    const intervalo = _homeTime === 'M1' ? '1min' : '5min';
+    // Mostrar spinner, ocultar lista
+    document.getElementById('home-loading').style.display = 'block';
+    document.getElementById('home-asset-list').style.display = 'none';
+    const infoEl = document.getElementById('home-refresh-info');
+    if (infoEl) infoEl.textContent = 'Escaneando... · ' + _homeTime;
 
     try {
       const resp = await fetch('/api/top-assets?intervalo=' + intervalo,
@@ -1645,40 +1722,76 @@ async def index():
       if (resp.status === 401) { handle401(); return; }
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       const data = await resp.json();
-      loadTxt.style.display = 'none';
       if (data.status === 'success') {
-        renderTopAssets(data.top_assets);
-        if (data.rate_limited) {
-          noteEl.textContent = '⚠️ Algunos activos no cargaron por límite de API. Espera 30 s y reescanea.';
-        } else {
-          noteEl.textContent = data.cached
-            ? '✦ Resultado desde caché (actualiza en <60 s)'
-            : '✦ Datos en tiempo real · Twelve Data';
-        }
-      } else {
-        listEl.innerHTML = '<div class="scan-empty">⚠️ Error al escanear. Intenta de nuevo.</div>';
+        renderBestOpp(data.top_assets);
+        renderHomeAssets(data.top_assets);
+        document.getElementById('home-loading').style.display = 'none';
+        document.getElementById('home-asset-list').style.display = 'block';
+        _startCountdown();
       }
     } catch (e) {
-      loadTxt.style.display = 'none';
-      listEl.innerHTML = '<div class="scan-empty">⚠️ Sin conexión. Intenta de nuevo.</div>';
-    } finally {
-      btn.disabled    = false;
-      btn.textContent = '🔍 Escanear';
+      document.getElementById('home-loading').style.display = 'none';
+      document.getElementById('home-best-opp').innerHTML =
+        '<div class="bow-wrap"><div class="bow-icon">⚠️</div>' +
+        '<div class="bow-title">SIN CONEXIÓN</div>' +
+        '<div class="bow-sub">No se pudo contactar el servidor.<br>Reintentando en 30 s.</div></div>';
+      if (infoEl) infoEl.textContent = 'Error · Reintentando...';
     }
   }
 
-  function renderTopAssets(assets) {
-    const listEl = document.getElementById('asset-list');
-    listEl.innerHTML = '';
-    if (!assets || assets.length === 0) {
-      listEl.innerHTML = '<div class="scan-empty">Sin activos disponibles en este momento.</div>';
+  function renderBestOpp(assets) {
+    const el = document.getElementById('home-best-opp');
+    if (!el) return;
+    // Buscar el primer activo confirmado (4/4 capas)
+    const best = (assets || []).find(a => a.confirmed === true);
+    if (!best) {
+      // No hay señal confirmada ahora
+      el.innerHTML =
+        '<div class="bow-wrap">' +
+          '<div class="bow-icon">🔍</div>' +
+          '<div class="bow-title">BUSCANDO OPORTUNIDAD</div>' +
+          '<div class="bow-sub">El escáner monitorea los 10 pares en tiempo real.<br>' +
+          'Te avisará cuando haya una entrada de 4/4 capas.</div>' +
+        '</div>';
       return;
     }
+    const isCall = best.signal === 'CALL';
+    const cls    = isCall ? 'call' : 'put';
+    const dir    = isCall ? '🟢 CALL — COMPRA ↑' : '🔴 PUT — VENTA ↓';
+    const conf   = best.confluence != null ? Number(best.confluence).toFixed(0) + '%' : '—';
+    el.innerHTML =
+      '<div class="boc-wrap ' + cls + '">' +
+        '<div class="boc-lbl">🔥 MEJOR OPORTUNIDAD ACTUAL</div>' +
+        '<div class="boc-dir ' + cls + '">' + dir + '</div>' +
+        '<div class="boc-meta">' +
+          '<span>' + (best.symbol || '') + ' · ' + _homeTime + '</span>' +
+          '<span class="boc-conf ' + cls + '">' + conf + ' confluencia</span>' +
+        '</div>' +
+        '<div class="boc-reason">' + (best.reason || '') + '</div>' +
+        '<button class="btn-ver-senal ' + cls + '" onclick="startAnalysis(\'' +
+          (best.symbol || '').replace(/'/g, '') + '\',\'' + _homeTime + '\')">⚡ Ver Señal Completa</button>' +
+      '</div>';
+  }
+
+  function renderHomeAssets(assets) {
+    const listEl = document.getElementById('home-asset-list');
+    if (!listEl) return;
+    listEl.innerHTML = '';
+    if (!assets || assets.length === 0) {
+      listEl.innerHTML = '<div style="text-align:center;font-size:11px;color:var(--muted);padding:16px 0;">Sin datos disponibles.</div>';
+      return;
+    }
+    // Pequeño título de sección
+    const titleDiv = document.createElement('div');
+    titleDiv.style.cssText = 'font-size:9px;font-weight:700;color:var(--muted);letter-spacing:1.2px;text-transform:uppercase;margin-bottom:8px;padding-top:4px;';
+    titleDiv.textContent = 'TODOS LOS PARES';
+    listEl.appendChild(titleDiv);
+
     assets.forEach(a => {
       const isCall      = a.signal === 'CALL';
       const isPut       = a.signal === 'PUT';
       const isConfirmed = a.confirmed === true;
-      // Badge verde/rojo SOLO cuando las 4 capas están confirmadas
+      const isApiLimit  = a.signal === 'API_LIMIT';
       const badgeCls = (isCall && isConfirmed) ? 'call'
                      : (isPut  && isConfirmed) ? 'put'
                      : ((isCall || isPut) && !isConfirmed) ? 'wait'
@@ -1687,37 +1800,27 @@ async def index():
         ? Number(a.confluence).toFixed(0) + '%' : '—';
 
       const pill = document.createElement('div');
-      pill.className = 'asset-pill';
-      // data-symbol en el elemento raíz: garantiza símbolo correcto sin importar dónde haga clic
+      pill.className = 'home-pill';
       pill.setAttribute('data-symbol', a.symbol || '');
-
-      const isApiLimit = a.signal === 'API_LIMIT';
       pill.innerHTML =
-        '<div class="ap-left">' +
-          '<div class="ap-symbol">' + (a.symbol || '') + '</div>' +
-          '<div class="ap-reason">' + (a.reason || '') + '</div>' +
+        '<div class="hp-left">' +
+          '<div class="hp-symbol">' + (a.symbol || '') + '</div>' +
+          '<div class="hp-reason">' + (a.reason || '') + '</div>' +
         '</div>' +
-        '<div class="ap-right">' +
-          '<div class="ap-badge ' + (isApiLimit ? 'flat' : badgeCls) + '">' + (isApiLimit ? '⚠️' : confLabel) + '</div>' +
-          '<div class="ap-label">' + (a.status_label || '') + '</div>' +
+        '<div class="hp-right">' +
+          '<div class="hp-badge ' + (isApiLimit ? 'flat' : badgeCls) + '">' +
+            (isApiLimit ? '⚠️' : confLabel) +
+          '</div>' +
+          '<div class="hp-label">' + (a.status_label || '') + '</div>' +
         '</div>';
-
       if (!isApiLimit) {
-        // e.currentTarget siempre apunta al pill (el que tiene el listener),
-        // aunque el clic venga de un elemento hijo
         pill.addEventListener('click', (e) => {
           const sym = e.currentTarget.getAttribute('data-symbol');
-          if (sym) selectTopAsset(sym);
+          if (sym) startAnalysis(sym, _homeTime);
         });
       }
       listEl.appendChild(pill);
     });
-  }
-
-  function selectTopAsset(symbol) {
-    const sel = document.getElementById('market-select');
-    if (sel) sel.value = symbol;
-    startAnalysis();
   }
 
   /* ── Academia acordeón ── */
