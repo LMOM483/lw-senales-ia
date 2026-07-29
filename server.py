@@ -8,9 +8,12 @@ import pandas as pd
 import ta as _ta
 import subprocess as _subprocess
 import sys as _sys
+import sqlite3 as _sqlite3
+import hashlib as _hashlib
+import secrets as _secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -41,6 +44,7 @@ async def lifespan(app: FastAPI):
         print(f"[LW] Bot de Telegram iniciado (PID {_bot_proceso.pid})", flush=True)
     except Exception as e:
         print(f"[LW] No se pudo iniciar main.py: {e}", flush=True)
+    _init_auth()
     yield
     # Al apagar el servidor, terminar el bot también
     if _bot_proceso and _bot_proceso.poll() is None:
@@ -53,8 +57,79 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # ── Modelo de entrada del endpoint ──────────────────────────────────────────
 
 class AnalisisRequest(BaseModel):
-    symbol: str        # ej. "EUR/USD"
-    temporalidad: str  # "M1" o "M5"
+    symbol: str
+    temporalidad: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+# ── Auth: SQLite users + sesión única anti-share ─────────────────────────────
+
+_AUTH_SALT = "lw_senales_ia_2026"   # salt fijo de aplicación
+
+def _hash_pw(password: str) -> str:
+    return _hashlib.pbkdf2_hmac(
+        "sha256", password.encode(), _AUTH_SALT.encode(), 100_000
+    ).hex()
+
+def _db_conn():
+    return _sqlite3.connect(Config.DATABASE_FILE, check_same_thread=False)
+
+def _init_auth():
+    """Crea tabla users e inserta usuario demo si no existe."""
+    with _db_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                email         TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                is_active     INTEGER DEFAULT 1,
+                session_token TEXT
+            )
+        """)
+        exists = conn.execute(
+            "SELECT id FROM users WHERE email = ?", ("demo@lwsenales.com",)
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                "INSERT INTO users (email, password_hash, is_active) VALUES (?,?,1)",
+                ("demo@lwsenales.com", _hash_pw("LW2026!"))
+            )
+            print("[LW-Auth] Usuario demo creado: demo@lwsenales.com / LW2026!")
+
+def _verificar_token(x_session_token: str = Header(None)):
+    """Dependency FastAPI: valida token de sesión. Lanza 401 si no es válido."""
+    if not x_session_token:
+        raise HTTPException(status_code=401, detail="No autenticado")
+    with _db_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM users WHERE session_token = ? AND is_active = 1",
+            (x_session_token,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=401, detail="Sesión inválida o abierta en otro dispositivo")
+    return x_session_token
+
+@app.post("/api/login")
+def api_login(req: LoginRequest):
+    email = req.email.strip().lower()
+    with _db_conn() as conn:
+        row = conn.execute(
+            "SELECT id, password_hash, is_active FROM users WHERE email = ?", (email,)
+        ).fetchone()
+    if not row or not row[2] or row[1] != _hash_pw(req.password):
+        return JSONResponse({"ok": False, "error": "Email o contraseña incorrectos."}, status_code=401)
+    token = _secrets.token_urlsafe(32)
+    with _db_conn() as conn:
+        conn.execute("UPDATE users SET session_token = ? WHERE id = ?", (token, row[0]))
+    return JSONResponse({"ok": True, "token": token})
+
+@app.post("/api/logout")
+def api_logout(token: str = Depends(_verificar_token)):
+    with _db_conn() as conn:
+        conn.execute("UPDATE users SET session_token = NULL WHERE session_token = ?", (token,))
+    return JSONResponse({"ok": True})
 
 # ── Función de datos (sync, reutiliza la misma lógica del bot) ───────────────
 
@@ -231,7 +306,7 @@ def _que_esperar(ind: dict) -> tuple:
 # ── Endpoint de análisis ─────────────────────────────────────────────────────
 
 @app.post("/api/analizar")
-def analizar_mercado(req: AnalisisRequest):
+def analizar_mercado(req: AnalisisRequest, _tok: str = Depends(_verificar_token)):
     """Análisis on-demand: siempre devuelve estado SEÑAL, ESPERAR o LATERAL con valores reales."""
     symbol       = req.symbol.strip()
     temporalidad = req.temporalidad
@@ -327,7 +402,7 @@ def analizar_mercado(req: AnalisisRequest):
 _scanner_cache: dict = {}   # intervalo → {"ts": float, "data": list}
 
 @app.get("/api/top-assets")
-def top_assets(intervalo: str = "5min"):
+def top_assets(intervalo: str = "5min", _tok: str = Depends(_verificar_token)):
     """Escanea todos los activos del pool y los devuelve ordenados por confluencia.
     Cache de 60 s para no saturar Twelve Data."""
     ahora_ts = datetime.now().timestamp()
@@ -897,13 +972,28 @@ async def index():
 
     <!-- ══ LOGIN ══ -->
     <div id="screen-login" class="tab-pane active">
-      <div class="form-group">
-        <label>Contraseña VIP</label>
-        <input type="password" id="app-password"
-               placeholder="Introduce la clave VIP..."
-               onkeydown="if(event.key==='Enter') login()">
+      <div style="text-align:center;margin-bottom:22px;">
+        <div style="font-family:'Orbitron',sans-serif;font-size:15px;font-weight:900;
+             background:linear-gradient(135deg,var(--purple),var(--cyan));
+             -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+             background-clip:text;letter-spacing:1px;">L&W PREMIUM IA SIGNS</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;">Acceso exclusivo para miembros</div>
       </div>
-      <button class="btn btn-primary" onclick="login()">Ingresar</button>
+      <div class="form-group">
+        <label>Email</label>
+        <input type="email" id="login-email" placeholder="tu@email.com"
+               onkeydown="if(event.key==='Enter') doLogin()">
+      </div>
+      <div class="form-group">
+        <label>Contraseña</label>
+        <input type="password" id="login-password" placeholder="••••••••"
+               onkeydown="if(event.key==='Enter') doLogin()">
+      </div>
+      <div id="login-error"
+           style="display:none;color:#f87171;font-size:12px;margin-bottom:12px;
+                  padding:10px 12px;background:rgba(239,68,68,.07);
+                  border:1px solid rgba(239,68,68,.25);border-radius:8px;"></div>
+      <button class="btn btn-primary" id="btn-login" onclick="doLogin()">Ingresar</button>
     </div>
 
     <!-- ══ TAB 1: BOT IA ══ -->
@@ -1256,52 +1346,49 @@ async def index():
       </div>
     </div><!-- /tab-resultados -->
 
-    <!-- ══ TAB 4: VIP ══ -->
-    <div id="tab-vip" class="tab-pane">
-      <div class="section-title">💎 Membresía VIP</div>
+    <!-- ══ TAB 4: SOPORTE ══ -->
+    <div id="tab-soporte" class="tab-pane">
+      <div class="section-title">💬 Soporte L&W</div>
 
-      <div class="vip-badge">
-        <div style="font-size:32px;margin-bottom:8px;">💎</div>
-        <div class="vip-price">$20</div>
-        <div class="vip-period">por mes · acceso inmediato</div>
-        <div style="font-size:11px;color:rgba(148,163,184,.55);">Cancela cuando quieras · Sin contratos</div>
+      <div style="text-align:center;margin-bottom:20px;padding:18px;
+           background:linear-gradient(135deg,rgba(34,197,94,.08),rgba(168,85,247,.08));
+           border:1px solid rgba(34,197,94,.2);border-radius:16px;">
+        <div style="font-size:28px;margin-bottom:6px;">✅</div>
+        <div style="font-family:'Orbitron',sans-serif;font-size:12px;color:#4ade80;
+             font-weight:700;letter-spacing:.5px;">MEMBRESÍA ACTIVA</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px;">
+          Tienes acceso completo a señales VIP, Academia y App web.
+        </div>
       </div>
 
-      <ul class="vip-features">
-        <li><span class="fi">🤖</span> Hasta <strong>8 señales VIP por sesión</strong> con hora de entrada exacta</li>
-        <li><span class="fi">⚡</span> Señales en <strong>M1 y M5</strong> — doble temporalidad</li>
-        <li><span class="fi">🎯</span> <strong>% de confluencia técnica</strong> y método de análisis en cada señal</li>
-        <li><span class="fi">✅</span> <strong>Resultado WIN/LOSS</strong> automático después de cada operación</li>
-        <li><span class="fi">🛡️</span> <strong>Freno de seguridad</strong>: pausa automática tras 2 LOSS seguidos</li>
-        <li><span class="fi">📊</span> <strong>Resumen de sesión</strong> con efectividad real al cierre</li>
-        <li><span class="fi">🎓</span> Acceso completo a la <strong>Academia L&W</strong></li>
-        <li><span class="fi">📱</span> <strong>App web</strong> para analizar cualquier par en tiempo real</li>
-        <li><span class="fi">💬</span> Soporte directo por Telegram con Lina</li>
-      </ul>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:14px;text-align:center;">
+        ¿Tienes alguna duda o necesitas ayuda? Contáctanos directamente:
+      </div>
 
-      <button class="btn btn-gold" onclick="window.open('https://t.me/+36KihCYd8Ww4MDVh','_blank')">
-        💎 Unirse al VIP ahora
-      </button>
-
-      <div class="vip-divider">── o contáctanos directamente ──</div>
-
-      <div class="contact-options">
+      <div class="contact-options" style="margin-bottom:14px;">
+        <a class="contact-btn btn-whatsapp"
+           href="https://wa.me/message/XXXXXXXXXX" target="_blank"
+           style="font-size:13px;padding:15px 10px;">
+          💬 WhatsApp
+        </a>
         <a class="contact-btn btn-telegram"
-           href="https://t.me/+36KihCYd8Ww4MDVh" target="_blank">
+           href="https://t.me/+36KihCYd8Ww4MDVh" target="_blank"
+           style="font-size:13px;padding:15px 10px;">
           ✈️ Telegram
         </a>
-        <a class="contact-btn btn-whatsapp"
-           href="https://wa.me/message/XXXXXXXXXX" target="_blank">
-          📱 WhatsApp
-        </a>
       </div>
 
-      <div class="vip-disclaimer">
-        El acceso VIP da derecho a recibir señales del canal Telegram privado L&W.
+      <div style="font-size:10px;color:rgba(148,163,184,.4);text-align:center;
+           margin-bottom:20px;line-height:1.6;">
+        Horario de soporte: Lun–Vie 9:00–18:00 (America/Sao Paulo).<br>
         Las señales son análisis técnicos automatizados, no asesoría financiera.
-        Opera siempre bajo tu propio riesgo con gestión adecuada del capital.
       </div>
-    </div><!-- /tab-vip -->
+
+      <button class="btn btn-secondary" onclick="doLogout()"
+              style="width:100%;font-size:12px;padding:11px;">
+        🚪 Cerrar sesión
+      </button>
+    </div><!-- /tab-soporte -->
 
   </div><!-- /content-area -->
 </div><!-- /card -->
@@ -1320,9 +1407,9 @@ async def index():
     <span class="nav-icon">🏆</span>
     <span class="nav-label">Resultados</span>
   </button>
-  <button class="nav-btn" id="nav-vip" onclick="switchTab('vip')">
-    <span class="nav-icon">💎</span>
-    <span class="nav-label">VIP</span>
+  <button class="nav-btn" id="nav-soporte" onclick="switchTab('soporte')">
+    <span class="nav-icon">💬</span>
+    <span class="nav-label">Soporte</span>
   </button>
 </nav>
 
@@ -1334,22 +1421,88 @@ async def index():
   }
   tickClock(); setInterval(tickClock, 1000);
 
-  /* ── Login ── */
-  function login() {
-    const pass = document.getElementById('app-password').value;
-    if (!pass) {
-      const el = document.getElementById('app-password');
-      el.style.borderColor = '#ef4444'; el.style.boxShadow = '0 0 12px rgba(239,68,68,.5)';
-      setTimeout(() => { el.style.borderColor = ''; el.style.boxShadow = ''; }, 1200);
-      return;
+  /* ── Token helpers ── */
+  const TOKEN_KEY = 'lw_token';
+  function getToken()    { return localStorage.getItem(TOKEN_KEY) || ''; }
+  function saveToken(t)  { localStorage.setItem(TOKEN_KEY, t); }
+  function clearToken()  { localStorage.removeItem(TOKEN_KEY); }
+  function apiHeaders()  {
+    return { 'Content-Type': 'application/json', 'X-Session-Token': getToken() };
+  }
+
+  /* ── Login / Logout ── */
+  async function doLogin() {
+    const email    = (document.getElementById('login-email').value    || '').trim();
+    const password = (document.getElementById('login-password').value || '');
+    const errEl    = document.getElementById('login-error');
+    const btnEl    = document.getElementById('btn-login');
+    errEl.style.display = 'none';
+    if (!email || !password) {
+      errEl.textContent   = 'Ingresa tu email y contraseña.';
+      errEl.style.display = 'block'; return;
     }
+    btnEl.disabled = true; btnEl.textContent = 'Verificando...';
+    try {
+      const resp = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        saveToken(data.token);
+        enterApp();
+      } else {
+        errEl.textContent   = data.error || 'Credenciales incorrectas.';
+        errEl.style.display = 'block';
+      }
+    } catch (e) {
+      errEl.textContent   = 'Error de conexión. Intenta de nuevo.';
+      errEl.style.display = 'block';
+    } finally {
+      btnEl.disabled = false; btnEl.textContent = 'Ingresar';
+    }
+  }
+
+  async function doLogout() {
+    try {
+      await fetch('/api/logout', { method: 'POST', headers: apiHeaders() });
+    } catch (_) {}
+    clearToken();
+    showLogin('Sesión cerrada correctamente.');
+  }
+
+  function enterApp() {
     document.getElementById('screen-login').classList.remove('active');
     document.getElementById('bottom-nav').classList.add('visible');
     switchTab('bot');
   }
 
+  function showLogin(msg) {
+    const TABS_ALL = ['bot', 'academia', 'resultados', 'soporte'];
+    TABS_ALL.forEach(t => document.getElementById('tab-' + t).classList.remove('active'));
+    document.getElementById('bottom-nav').classList.remove('visible');
+    document.getElementById('screen-login').classList.add('active');
+    if (msg) {
+      const errEl = document.getElementById('login-error');
+      errEl.textContent   = msg;
+      errEl.style.display = 'block';
+      errEl.style.color   = msg.startsWith('⚠️') ? '#f87171' : '#4ade80';
+    }
+  }
+
+  function handle401() {
+    clearToken();
+    showLogin('⚠️ Tu sesión se ha abierto en otro dispositivo. Vuelve a iniciar sesión.');
+  }
+
+  /* ── Arranque: restaurar sesión si existe token ── */
+  (function initSession() {
+    if (getToken()) { enterApp(); }
+  })();
+
   /* ── Tabs principales ── */
-  const TABS = ['bot', 'academia', 'resultados', 'vip'];
+  const TABS = ['bot', 'academia', 'resultados', 'soporte'];
   function switchTab(name) {
     TABS.forEach(t => {
       document.getElementById('tab-' + t).classList.toggle('active', t === name);
@@ -1385,9 +1538,10 @@ async def index():
     try {
       const resp = await fetch('/api/analizar', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: apiHeaders(),
         body: JSON.stringify({ symbol, temporalidad }),
       });
+      if (resp.status === 401) { handle401(); return; }
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       const data = await resp.json();
       document.getElementById('loading-wrap').style.display = 'none';
@@ -1397,7 +1551,6 @@ async def index():
       } else if (data.estado === 'ESPERAR' || data.estado === 'LATERAL') {
         renderEsperar(data);
       } else {
-        // ERROR u otro estado inesperado
         document.getElementById('error-msg').textContent =
           '⚠️ ' + (data.mensaje || 'No se pudo obtener datos. Intenta de nuevo.');
         document.getElementById('error-msg').style.display = 'block';
@@ -1487,7 +1640,9 @@ async def index():
     noteEl.textContent   = '';
 
     try {
-      const resp = await fetch('/api/top-assets?intervalo=' + intervalo);
+      const resp = await fetch('/api/top-assets?intervalo=' + intervalo,
+                               { headers: apiHeaders() });
+      if (resp.status === 401) { handle401(); return; }
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       const data = await resp.json();
       loadTxt.style.display = 'none';
