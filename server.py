@@ -179,13 +179,19 @@ def _que_esperar(ind: dict) -> tuple:
             condiciones.append(f"RSI = {rsi:.1f} — sobrecompra, esperar retroceso bajo 70")
         elif rsi < rsi_prev:
             condiciones.append(f"RSI = {rsi:.1f} cayendo — esperar que vuelva a subir")
-        # Estocástico
-        if not ind["cruce_arriba"]:
-            condiciones.append(
-                f"Estocástico: %K {k_act:.0f} vs %D {d_act:.0f} — esperar que %K cruce por encima de %D"
-            )
-        elif k_act >= 80:
+        # Estocástico — mensaje según posición actual de K vs D
+        if k_act >= 80:
             condiciones.append(f"Estocástico sobrecomprado (%K {k_act:.0f}) — esperar retroceso bajo 80")
+        elif not ind["cruce_arriba"]:
+            if k_act > d_act:
+                # K ya está por encima de D pero el cruce no ocurrió en esta vela
+                condiciones.append(
+                    f"Estocástico en zona de compra (%K {k_act:.0f} > %D {d_act:.0f}) — aguardar señal de cruce en esta vela"
+                )
+            else:
+                condiciones.append(
+                    f"Estocástico: %K {k_act:.0f} < %D {d_act:.0f} — esperar que %K cruce por encima de %D"
+                )
     else:  # PUT
         if rsi > 50:
             condiciones.append(f"RSI = {rsi:.1f} — necesita bajar de 50 para confirmar presión vendedora")
@@ -193,13 +199,19 @@ def _que_esperar(ind: dict) -> tuple:
             condiciones.append(f"RSI = {rsi:.1f} — sobreventa, esperar rebote sobre 30")
         elif rsi > rsi_prev:
             condiciones.append(f"RSI = {rsi:.1f} subiendo — esperar que vuelva a bajar")
-        # Estocástico
-        if not ind["cruce_abajo"]:
-            condiciones.append(
-                f"Estocástico: %K {k_act:.0f} vs %D {d_act:.0f} — esperar que %K cruce por debajo de %D"
-            )
-        elif k_act <= 20:
+        # Estocástico — mensaje según posición actual de K vs D
+        if k_act <= 20:
             condiciones.append(f"Estocástico sobrevendido (%K {k_act:.0f}) — esperar rebote sobre 20")
+        elif not ind["cruce_abajo"]:
+            if k_act < d_act:
+                # K ya está por debajo de D pero el cruce no ocurrió en esta vela
+                condiciones.append(
+                    f"Estocástico en zona de venta (%K {k_act:.0f} < %D {d_act:.0f}) — aguardar señal de cruce en esta vela"
+                )
+            else:
+                condiciones.append(
+                    f"Estocástico: %K {k_act:.0f} > %D {d_act:.0f} — esperar que %K cruce por debajo de %D"
+                )
 
     # MACD
     if dir_macd != dir_t:
@@ -328,7 +340,8 @@ def top_assets(intervalo: str = "5min"):
                     "symbol": simbolo,
                     "confluence": round(float(conf), 1),
                     "signal": dir_,
-                    "status_label": "🟢 OPORTUNIDAD ALTA" if dir_ == "CALL" else "🔴 OPORTUNIDAD BAJISTA",
+                    "confirmed": True,   # 4/4 capas superadas
+                    "status_label": "🟢 ENTRADA CONFIRMADA" if dir_ == "CALL" else "🔴 ENTRADA CONFIRMADA",
                     "reason": _construir_motivo(ind, dir_, metodo),
                 })
                 continue
@@ -369,6 +382,7 @@ def top_assets(intervalo: str = "5min"):
                 "symbol": simbolo,
                 "confluence": float(score),
                 "signal": signal,
+                "confirmed": False,   # no llegó a 4/4 capas
                 "status_label": label,
                 "reason": " + ".join(partes) if partes else "Sin confluencia técnica",
             })
@@ -1474,10 +1488,14 @@ async def index():
       return;
     }
     assets.forEach(a => {
-      const isCall = a.signal === 'CALL';
-      const isPut  = a.signal === 'PUT';
-      const isWait = !isCall && !isPut && (a.confluence || 0) >= 30;
-      const badgeCls  = isCall ? 'call' : (isPut ? 'put' : (isWait ? 'wait' : 'flat'));
+      const isCall      = a.signal === 'CALL';
+      const isPut       = a.signal === 'PUT';
+      const isConfirmed = a.confirmed === true;
+      // Badge verde/rojo SOLO cuando las 4 capas están confirmadas
+      const badgeCls = (isCall && isConfirmed) ? 'call'
+                     : (isPut  && isConfirmed) ? 'put'
+                     : ((isCall || isPut) && !isConfirmed) ? 'wait'
+                     : 'flat';
       const confLabel = (a.confluence != null && a.confluence > 0)
         ? Number(a.confluence).toFixed(0) + '%' : '—';
 
