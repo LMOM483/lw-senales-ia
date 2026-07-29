@@ -621,6 +621,7 @@ async def index():
         <div id="no-signal" class="no-signal">
           <div class="ns-title">⏳ Sin confluencia ahora</div>
           <p id="no-signal-msg">El mercado no presenta condiciones técnicas claras. Intenta en unos minutos o cambia de par.</p>
+          <div id="no-signal-diag" style="margin-top:10px;padding:8px 10px;background:rgba(255,255,255,.04);border-radius:8px;font-size:10px;color:rgba(148,163,184,.6);line-height:1.8;display:none;text-align:left;font-family:monospace;"></div>
         </div>
 
         <div id="error-msg" class="error-msg"></div>
@@ -987,6 +988,13 @@ async def index():
       if (!data.ok && data.sin_señal) {
         document.getElementById('no-signal-msg').textContent =
           data.mensaje || 'Sin confluencia técnica en este momento.';
+        const diagEl = document.getElementById('no-signal-diag');
+        if (data.diagnostico) {
+          diagEl.textContent = '🔎 ' + data.diagnostico;
+          diagEl.style.display = 'block';
+        } else {
+          diagEl.style.display = 'none';
+        }
         document.getElementById('no-signal').style.display = 'block';
         return;
       }

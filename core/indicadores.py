@@ -156,6 +156,50 @@ def _vela_rechazo_contraria(df: pd.DataFrame, direccion: str) -> bool:
         return True
 
 
+def _vela_confirmacion_fuerte(df: pd.DataFrame, direccion: str) -> bool:
+    """Fix #4: la ULTIMA vela (la que confirma la señal) debe cerrar con cuerpo real
+    a favor de la tendencia y sin mecha de rechazo dominante en la dirección contraria.
+
+    Requisitos:
+    - El cuerpo (|close - open|) debe ser >= 35% del rango total (high - low)
+    - La vela debe cerrar EN la dirección de la señal (close > open para CALL)
+    - La mecha contraria NO debe superar el 80% del cuerpo
+
+    Devuelve True si la vela es válida (señal pasa), False si bloquea.
+    """
+    try:
+        if len(df) < 2:
+            return True
+        vela = df.iloc[-1]
+        rango = vela["high"] - vela["low"]
+        if rango == 0:
+            return True   # vela doji — no bloquear, dejar que otras capas decidan
+        cuerpo = abs(vela["close"] - vela["open"])
+
+        # Condición 1: cuerpo mínimo del 35% del rango
+        if cuerpo / rango < 0.35:
+            return False
+
+        # Condición 2: cierre en la dirección correcta
+        if direccion == "CALL" and vela["close"] <= vela["open"]:
+            return False
+        if direccion == "PUT" and vela["close"] >= vela["open"]:
+            return False
+
+        # Condición 3: mecha contraria no mayor al 80% del cuerpo
+        if cuerpo > 0:
+            mecha_sup = vela["high"] - max(vela["close"], vela["open"])
+            mecha_inf = min(vela["close"], vela["open"]) - vela["low"]
+            if direccion == "CALL" and mecha_inf > cuerpo * 0.80:
+                return False   # mecha bajista larga en señal alcista
+            if direccion == "PUT" and mecha_sup > cuerpo * 0.80:
+                return False   # mecha alcista larga en señal bajista
+
+        return True
+    except Exception:
+        return True   # ante error, no bloquear
+
+
 def _divergencia_rsi(df: pd.DataFrame, direccion: str) -> bool:
     """CAPA 4 (confirmacion premium): detecta divergencia RSI clasica en las ultimas velas.
 
@@ -244,6 +288,9 @@ def evaluar_estrategias(df: pd.DataFrame) -> list:
     if _vela_rechazo_contraria(df.copy(), direccion):
         return []
 
+    if not _vela_confirmacion_fuerte(df.copy(), direccion):
+        return []
+
     hay_cruce      = _cruce_reciente_ema(df.copy(), direccion)
     hay_divergencia = _divergencia_rsi(df.copy(), direccion)
 
@@ -271,10 +318,12 @@ def diagnostico(df: pd.DataFrame) -> str:
         m = _capa_momentum(df.copy())
         mc = _capa_macd(df.copy())
         rechazo = _vela_rechazo_contraria(df.copy(), t) if t else "N/A"
+        vela_ok = _vela_confirmacion_fuerte(df.copy(), t) if t else "N/A"
         macd_ok = "OK" if mc == t else "FALTA"
         div = _divergencia_rsi(df.copy(), t) if t else False
         return (f"Vol={'SI' if vol else 'NO'} | T={t or '-'} | M={m or '-'} | "
                 f"MACD={mc or '-'}({macd_ok}) | Rechazo={rechazo} | "
+                f"VelaFuerte={'SI' if vela_ok else 'NO'} | "
                 f"DivRSI={'SI +4%' if div else 'NO'}")
     except Exception as e:
         return f"(diagnostico no disponible: {e})"

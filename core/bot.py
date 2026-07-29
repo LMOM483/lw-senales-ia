@@ -38,6 +38,7 @@ class TradexoBot:
         self._activos_activos = []         # activos con movimiento de la sesión actual
         self._consecutivas_loss = 0        # LOSS seguidas en la sesión actual (freno de seguridad)
         self._sesion_pausada = False       # True si la sesión está pausada por 2 LOSS seguidos
+        self._cooldown_senal_post_expiry = {}  # activo -> datetime: 5 min cooldown por par post-expiry
         self._ws_precios = TwelveDataPreciosWS(self.config.TWELVE_DATA_API_KEY)
         self._ws_precios.start()
         self._ultimo_origen_precio = "REST"
@@ -115,6 +116,12 @@ class TradexoBot:
         ahora = ahora or datetime.now(TIMEZONE)
         self._cooldown[symbol] = ahora + timedelta(hours=self.config.COOLDOWN_HORAS_TRAS_PERDIDA)
         self.log(f"❄️  Cooldown {self.config.COOLDOWN_HORAS_TRAS_PERDIDA}h aplicado a {symbol}")
+
+    def en_cooldown_post_expiry(self, symbol, ahora=None):
+        """True si el par está en pausa de 5 min post-expiración (fix #1)."""
+        ahora = ahora or datetime.now(TIMEZONE)
+        hasta = self._cooldown_senal_post_expiry.get(symbol)
+        return hasta is not None and ahora < hasta
 
     # ── Aprendizaje simple: ajusta tasa de acierto por activo (se reinicia si el bot se reinicia) ──
     def actualizar_tasa_acierto(self, symbol, gano: bool):
@@ -297,24 +304,32 @@ class TradexoBot:
                     f"({origen}, retraso={retraso:.1f}s)"
                 )
 
-            # PASO 3: si la operación aún no terminó (no llegó expira_en), seguir esperando
-            if ahora < p["expira_en"]:
+            # PASO 3: esperar hasta expira_en + 15s para que Twelve Data cierre la vela oficial
+            if ahora < p["expira_en"] + timedelta(seconds=15):
                 aun_pendientes.append(p)
                 continue
 
-            # PASO 4: la operacion termino — evaluar WIN/LOSS con precio mas cercano al cierre exacto
-            precio_cierre = self.obtener_precio_actual(p["activo"])
+            # PASO 4: la operacion termino — evaluar WIN/LOSS con el cierre OHLC real de Twelve Data
+            # Se usa REST explícito (no WebSocket) para obtener el close de la vela ya cerrada.
+            intervalo_eval = p.get("intervalo", "5min")
+            df_eval = self.obtener_datos_mercado(p["activo"], intervalo=intervalo_eval)
+            precio_cierre = float(df_eval["close"].iloc[-1]) if df_eval is not None else None
+
             if precio_cierre is None:
                 p["reintentos_cierre"] = p.get("reintentos_cierre", 0) + 1
                 if p["reintentos_cierre"] <= 3:
                     aun_pendientes.append(p)
-                    self.log(f"⚠️  Reintento {p['reintentos_cierre']}/3: sin datos de cierre {p['activo']}")
+                    self.log(f"⚠️  Reintento {p['reintentos_cierre']}/3: sin cierre REST {p['activo']}")
                 else:
-                    self.log(f"❌ Señal {p['activo']} descartada tras 3 reintentos sin datos de cierre")
+                    self.log(f"❌ Señal {p['activo']} descartada tras 3 reintentos sin datos")
                     self.actualizar_resultado(p["id"], "SIN_DATOS")
                 continue
-            origen_cierre = self._ultimo_origen_precio
+
             retraso_cierre = (ahora - p["expira_en"]).total_seconds()
+            self.log(
+                f"📊 Evaluando {p['activo']} {p['senal']}: entrada={p['precio_entrada']:.5f} "
+                f"cierre={precio_cierre:.5f} (REST {intervalo_eval}, retraso={retraso_cierre:.0f}s)"
+            )
             gano = (
                 precio_cierre > p["precio_entrada"] if p["senal"] == "CALL"
                 else precio_cierre < p["precio_entrada"]
@@ -348,10 +363,14 @@ class TradexoBot:
                     resultados_sesion.get("perdidas", 0)
                 )
 
+            # Cooldown 5 min por par post-expiry (fix #1): no re-analizar el mismo par
+            self._cooldown_senal_post_expiry[p["activo"]] = p["expira_en"] + timedelta(minutes=5)
+
             self._ultimo_resultado = ahora
             self.log(
                 f"🏁 Resultado {p['activo']} {p['senal']}: {resultado} "
-                f"(consecutivas_loss={self._consecutivas_loss})"
+                f"(consecutivas_loss={self._consecutivas_loss}) | "
+                f"cooldown_post_expiry 5min activado"
             )
 
         self._pendientes = aun_pendientes
@@ -433,6 +452,7 @@ class TradexoBot:
             # Nueva sesión: reiniciar contadores de seguridad
             self._consecutivas_loss = 0
             self._sesion_pausada = False
+            self._cooldown_senal_post_expiry = {}   # limpiar cooldowns de sesión anterior
             pool = getattr(self.config, "POOL_FOREX", None) or datos_sesion["activos"]
             activos_buenos = self.filtrar_activos_con_movimiento(pool)
             self._activos_activos = activos_buenos[:10]
@@ -469,6 +489,13 @@ class TradexoBot:
                     faltan = round(self.config.MINUTOS_ENTRE_SEÑALES - minutos_desde_ultima)
                     self.log(f"⏸️  Esperando separación entre señales ({faltan} min restantes)")
                     break  # no procesar más activos este ciclo
+
+            # Cooldown 5 min post-expiry por par (fix #1): saltar si el par aún no enfría
+            if self.en_cooldown_post_expiry(activo, ahora):
+                hasta = self._cooldown_senal_post_expiry[activo]
+                faltan = round((hasta - ahora).total_seconds() / 60, 1)
+                self.log(f"⏳ {activo}: cooldown 5min post-expiry ({faltan} min restantes)")
+                continue
 
             # Analizar en M5 primero (más fiable), luego M1 como alternativa.
             # Si M5 tiene señal la preferimos; si no, usamos M1.
@@ -514,6 +541,7 @@ class TradexoBot:
                     "hora_entrada": senal["entrada"],
                     "clave_sesion": clave_sesion,
                     "expira_en": senal["entrada"] + timedelta(minutes=senal["expiracion_minutos"]),
+                    "intervalo": "1min" if senal["temporalidad"] == "M1" else "5min",
                 })
                 break  # solo UNA señal por ciclo, para respetar la separación entre señales
 
