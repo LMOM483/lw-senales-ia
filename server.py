@@ -619,13 +619,13 @@ async def index():
       color: var(--purple); letter-spacing: 1.5px;
       text-transform: uppercase; margin-bottom: 7px;
     }
-    input[type="password"], select {
+    input[type="email"], input[type="password"], select {
       width: 100%; padding: 12px 15px;
       background: var(--surface); border: 1px solid rgba(59,130,246,.45);
       border-radius: 11px; color: #fff; font-size: 15px;
       outline: none; transition: border-color .2s, box-shadow .2s; appearance: none;
     }
-    input[type="password"]:focus, select:focus {
+    input[type="email"]:focus, input[type="password"]:focus, select:focus {
       border-color: var(--cyan); box-shadow: 0 0 12px rgba(0,242,254,.3);
     }
     select option { background: #181d33; }
@@ -1549,7 +1549,12 @@ async def index():
 
   /* ── Arranque: restaurar sesión si existe token ── */
   (function initSession() {
-    if (getToken()) { enterApp(); }
+    try {
+      if (getToken()) { enterApp(); }
+    } catch (_) {
+      /* localStorage no disponible — mostrar login por defecto */
+      document.getElementById('screen-login').style.display = 'block';
+    }
   })();
 
   /* ── Tabs principales ── */
@@ -1725,8 +1730,8 @@ async def index():
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       const data = await resp.json();
       if (data.status === 'success') {
-        renderBestOpp(data.top_assets);
-        renderHomeAssets(data.top_assets);
+        try { renderBestOpp(data.top_assets); } catch(re) { console.error('[LW] renderBestOpp:', re); }
+        try { renderHomeAssets(data.top_assets); } catch(re) { console.error('[LW] renderHomeAssets:', re); }
         document.getElementById('home-loading').style.display = 'none';
         document.getElementById('home-asset-list').style.display = 'block';
         _startCountdown();
@@ -1744,6 +1749,7 @@ async def index():
   function renderBestOpp(assets) {
     const el = document.getElementById('home-best-opp');
     if (!el) return;
+    try {
     // Buscar el primer activo confirmado (4/4 capas)
     const best = (assets || []).find(a => a.confirmed === true);
     if (!best) {
@@ -1773,11 +1779,18 @@ async def index():
         '<button class="btn-ver-senal ' + cls + '" onclick="startAnalysis(\'' +
           (best.symbol || '').replace(/'/g, '') + '\',\'' + _homeTime + '\')">⚡ Ver Señal Completa</button>' +
       '</div>';
+    } catch (e) {
+      console.error('[LW] renderBestOpp error:', e);
+      el.innerHTML = '<div class="bow-wrap"><div class="bow-icon">⚠️</div>' +
+        '<div class="bow-title">ERROR AL RENDERIZAR</div>' +
+        '<div class="bow-sub">Reintentando en el próximo escaneo.</div></div>';
+    }
   }
 
   function renderHomeAssets(assets) {
     const listEl = document.getElementById('home-asset-list');
     if (!listEl) return;
+    try {
     listEl.innerHTML = '';
     if (!assets || assets.length === 0) {
       listEl.innerHTML = '<div style="text-align:center;font-size:11px;color:var(--muted);padding:16px 0;">Sin datos disponibles.</div>';
@@ -1823,6 +1836,10 @@ async def index():
       }
       listEl.appendChild(pill);
     });
+    } catch (e) {
+      console.error('[LW] renderHomeAssets error:', e);
+      listEl.innerHTML = '<div style="text-align:center;font-size:11px;color:var(--muted);padding:16px 0;">Error al mostrar activos. Reintentando...</div>';
+    }
   }
 
   /* ── Academia acordeón ── */
