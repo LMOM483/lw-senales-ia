@@ -301,6 +301,85 @@ def analizar_mercado(req: AnalisisRequest):
     })
 
 
+# ── Endpoint Escáner de mejores activos ──────────────────────────────────────
+_scanner_cache: dict = {}   # intervalo → {"ts": float, "data": list}
+
+@app.get("/api/top-assets")
+def top_assets(intervalo: str = "5min"):
+    """Escanea todos los activos del pool y los devuelve ordenados por confluencia.
+    Cache de 60 s para no saturar Twelve Data."""
+    ahora_ts = datetime.now().timestamp()
+    cached = _scanner_cache.get(intervalo)
+    if cached and ahora_ts - cached["ts"] < 60:
+        return JSONResponse({"status": "success", "cached": True, "top_assets": cached["data"]})
+
+    resultados = []
+    for simbolo in Config.POOL_FOREX:
+        try:
+            df = _obtener_df(simbolo, intervalo)
+            if df is None:
+                continue
+            ind = _calcular_indicadores(df.copy())
+            senales = evaluar_estrategias(df)
+
+            if senales:
+                dir_, conf, metodo = senales[0]
+                resultados.append({
+                    "symbol": simbolo,
+                    "confluence": round(float(conf), 1),
+                    "signal": dir_,
+                    "status_label": "🟢 OPORTUNIDAD ALTA" if dir_ == "CALL" else "🔴 OPORTUNIDAD BAJISTA",
+                    "reason": _construir_motivo(ind, dir_, metodo),
+                })
+                continue
+
+            # Sin señal: puntuación parcial por capas que sí pasaron
+            score = 0
+            partes = []
+            dir_t = ind["tendencia"]
+
+            if dir_t:
+                score += 25
+                partes.append("Tendencia " + ("alcista" if dir_t == "CALL" else "bajista"))
+            if dir_t and ind["macd"] == dir_t:
+                score += 20
+                partes.append("MACD confirma")
+            rsi = ind["rsi"]
+            if dir_t == "CALL" and 50 <= rsi <= 70:
+                score += 20
+                partes.append(f"RSI {rsi:.0f} en zona")
+            elif dir_t == "PUT" and 30 <= rsi <= 50:
+                score += 20
+                partes.append(f"RSI {rsi:.0f} en zona")
+            if dir_t == "CALL" and ind["cruce_arriba"]:
+                score += 15
+                partes.append("Estocástico cruzó al alza")
+            elif dir_t == "PUT" and ind["cruce_abajo"]:
+                score += 15
+                partes.append("Estocástico cruzó a la baja")
+
+            if score >= 45 and dir_t:
+                label  = "🟡 SEÑAL EN FORMACIÓN"
+                signal = dir_t
+            else:
+                label  = "⚪ MERCADO LATERAL"
+                signal = "LATERAL"
+
+            resultados.append({
+                "symbol": simbolo,
+                "confluence": float(score),
+                "signal": signal,
+                "status_label": label,
+                "reason": " + ".join(partes) if partes else "Sin confluencia técnica",
+            })
+        except Exception:
+            continue
+
+    resultados.sort(key=lambda x: x["confluence"], reverse=True)
+    _scanner_cache[intervalo] = {"ts": ahora_ts, "data": resultados}
+    return JSONResponse({"status": "success", "cached": False, "top_assets": resultados})
+
+
 # ── Frontend ─────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
@@ -548,6 +627,55 @@ async def index():
     }
     .motivo-txt { font-size: 11px; color: rgba(148,163,184,.55); margin-top: 12px; line-height: 1.55; border-top: 1px solid rgba(255,255,255,.06); padding-top: 10px; }
 
+    /* ══ MÓDULO ESCÁNER DE ACTIVOS ══ */
+    .scanner-module {
+      margin-bottom: 16px; border-radius: 14px; overflow: hidden;
+      border: 1px solid rgba(168,85,247,.22);
+    }
+    .scanner-module-header {
+      padding: 11px 14px; background: rgba(168,85,247,.07);
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .scanner-module-title {
+      font-size: 11px; font-weight: 700; color: var(--purple);
+      font-family: 'Orbitron', sans-serif; letter-spacing: .3px;
+    }
+    .btn-scan {
+      font-size: 11px; padding: 7px 13px; border-radius: 8px; border: none;
+      background: linear-gradient(135deg, var(--purple), var(--cyan));
+      color: #fff; font-weight: 700; cursor: pointer;
+      transition: opacity .15s; white-space: nowrap;
+    }
+    .btn-scan:hover  { opacity: .82; }
+    .btn-scan:disabled { opacity: .45; cursor: wait; }
+    .asset-list { padding: 8px 8px 2px; }
+    .asset-pill {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 11px; border-radius: 10px; margin-bottom: 6px;
+      background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.07);
+      cursor: pointer; transition: background .15s, border-color .15s; gap: 8px;
+    }
+    .asset-pill:hover { background: rgba(168,85,247,.09); border-color: rgba(168,85,247,.3); }
+    .asset-pill:last-child { margin-bottom: 0; }
+    .ap-left { flex: 1; min-width: 0; }
+    .ap-symbol { font-size: 13px; font-weight: 700; color: #e2e8f0; }
+    .ap-reason { font-size: 10px; color: var(--muted); margin-top: 2px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .ap-right { text-align: right; flex-shrink: 0; }
+    .ap-badge {
+      font-size: 12px; font-weight: 800; padding: 3px 9px; border-radius: 6px;
+      display: inline-block; margin-bottom: 3px;
+    }
+    .ap-badge.call { background: rgba(34,197,94,.13); color: #4ade80; border: 1px solid rgba(34,197,94,.28); }
+    .ap-badge.put  { background: rgba(239,68,68,.13);  color: #f87171; border: 1px solid rgba(239,68,68,.28); }
+    .ap-badge.wait { background: rgba(234,179,8,.12);  color: #fbbf24; border: 1px solid rgba(234,179,8,.25); }
+    .ap-badge.flat { background: rgba(148,163,184,.07); color: rgba(148,163,184,.6); border: 1px solid rgba(148,163,184,.18); }
+    .ap-label { font-size: 9px; color: var(--muted); line-height: 1.3; }
+    .scan-empty { padding: 12px; text-align: center; font-size: 11px; color: var(--muted); }
+    .scan-loading-txt { padding: 14px; text-align: center; font-size: 11px; color: var(--muted); }
+    .scan-cache-note { font-size: 9px; color: rgba(148,163,184,.35); text-align: right;
+      padding: 0 10px 8px; }
+
     /* ═══ DISCLAIMER ═══ */
     .disclaimer {
       margin-top: 16px;
@@ -741,6 +869,22 @@ async def index():
 
       <!-- Sub-pantalla: config -->
       <div id="scanner-config" class="scanner-screen active">
+
+        <!-- ══ MÓDULO ESCÁNER DE MEJORES ACTIVOS ══ -->
+        <div class="scanner-module">
+          <div class="scanner-module-header">
+            <div class="scanner-module-title">🔥 ACTIVOS RECOMENDADOS</div>
+            <button class="btn-scan" id="btn-scan" onclick="scanTopAssets()">🔍 Escanear</button>
+          </div>
+          <div id="asset-list-wrap" style="display:none">
+            <div id="scan-loading-txt" class="scan-loading-txt" style="display:none">
+              ⏳ Analizando mercado completo...
+            </div>
+            <div class="asset-list" id="asset-list"></div>
+            <div class="scan-cache-note" id="scan-cache-note"></div>
+          </div>
+        </div>
+
         <div class="form-group">
           <label>Mercado</label>
           <select id="market-select">
@@ -1281,6 +1425,82 @@ async def index():
     });
 
     document.getElementById('wait-card').style.display = 'block';
+  }
+
+  /* ── Escáner de mejores activos ── */
+  async function scanTopAssets() {
+    const tempSel  = document.getElementById('time-select').value;
+    const intervalo = tempSel === 'M1' ? '1min' : '5min';
+    const btn      = document.getElementById('btn-scan');
+    const wrap     = document.getElementById('asset-list-wrap');
+    const loadTxt  = document.getElementById('scan-loading-txt');
+    const listEl   = document.getElementById('asset-list');
+    const noteEl   = document.getElementById('scan-cache-note');
+
+    btn.disabled    = true;
+    btn.textContent = '⏳ Analizando...';
+    wrap.style.display   = 'block';
+    loadTxt.style.display = 'block';
+    listEl.innerHTML     = '';
+    noteEl.textContent   = '';
+
+    try {
+      const resp = await fetch('/api/top-assets?intervalo=' + intervalo);
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const data = await resp.json();
+      loadTxt.style.display = 'none';
+      if (data.status === 'success') {
+        renderTopAssets(data.top_assets);
+        noteEl.textContent = data.cached
+          ? '✦ Resultado desde caché (actualiza en <60 s)'
+          : '✦ Datos en tiempo real · Twelve Data';
+      } else {
+        listEl.innerHTML = '<div class="scan-empty">⚠️ Error al escanear. Intenta de nuevo.</div>';
+      }
+    } catch (e) {
+      loadTxt.style.display = 'none';
+      listEl.innerHTML = '<div class="scan-empty">⚠️ Sin conexión. Intenta de nuevo.</div>';
+    } finally {
+      btn.disabled    = false;
+      btn.textContent = '🔍 Escanear';
+    }
+  }
+
+  function renderTopAssets(assets) {
+    const listEl = document.getElementById('asset-list');
+    listEl.innerHTML = '';
+    if (!assets || assets.length === 0) {
+      listEl.innerHTML = '<div class="scan-empty">Sin activos disponibles en este momento.</div>';
+      return;
+    }
+    assets.forEach(a => {
+      const isCall = a.signal === 'CALL';
+      const isPut  = a.signal === 'PUT';
+      const isWait = !isCall && !isPut && (a.confluence || 0) >= 30;
+      const badgeCls  = isCall ? 'call' : (isPut ? 'put' : (isWait ? 'wait' : 'flat'));
+      const confLabel = (a.confluence != null && a.confluence > 0)
+        ? Number(a.confluence).toFixed(0) + '%' : '—';
+
+      const pill = document.createElement('div');
+      pill.className = 'asset-pill';
+      pill.innerHTML =
+        '<div class="ap-left">' +
+          '<div class="ap-symbol">' + (a.symbol || '') + '</div>' +
+          '<div class="ap-reason">' + (a.reason || '') + '</div>' +
+        '</div>' +
+        '<div class="ap-right">' +
+          '<div class="ap-badge ' + badgeCls + '">' + confLabel + '</div>' +
+          '<div class="ap-label">' + (a.status_label || '') + '</div>' +
+        '</div>';
+      pill.addEventListener('click', () => selectTopAsset(a.symbol));
+      listEl.appendChild(pill);
+    });
+  }
+
+  function selectTopAsset(symbol) {
+    const sel = document.getElementById('market-select');
+    if (sel) sel.value = symbol;
+    startAnalysis();
   }
 
   /* ── Academia acordeón ── */
