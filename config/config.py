@@ -43,40 +43,40 @@ class Config:
     RSI_PERIOD = 7
 
     # ==================== POOL DE FOREX REAL ====================
-    # Todos los pares de forex de mercado real que el bot puede considerar.
-    # NO incluye oro (XAU) por la guerra, NI cripto (es OTC en Quotex).
-    # El bot elige automaticamente de esta lista los que tengan movimiento
-    # en cada sesion, y descarta los planos. Lina ya no elige a mano.
+    # Ajustado 2026-07-29 con datos reales de 219 señales:
+    # Removidos activos con <50% win rate: EUR/USD(42.9%), EUR/AUD(43.8%),
+    # EUR/CHF(45.0%), GBP/USD(46.7%), USD/CAD(33.3%)
+    # Priorizados activos con >60% win rate: AUD/JPY(77.8%), USD/JPY(70%),
+    # CAD/JPY(66.7%), NZD/USD(60%), USD/CHF(60%)
     POOL_FOREX = [
-        "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CHF",
-        "EUR/GBP", "EUR/JPY", "GBP/JPY", "AUD/JPY", "CAD/JPY",
-        "EUR/AUD", "EUR/CHF", "GBP/CHF", 
+        "AUD/JPY", "USD/JPY", "CAD/JPY", "NZD/USD", "USD/CHF",
+        "EUR/JPY", "GBP/JPY", "EUR/GBP", "GBP/CHF", "NZD/JPY",
     ]
 
     # ==================== SESIONES (M1, sin CRYPTO NIGHT) ====================
-    # Activos amplios para que Lina elija con analizar_activos.py segun el dia.
-    # CRYPTO NIGHT eliminada: cripto es OTC en Quotex (regla firme: solo mercado real)
+    # Ajuste 2026-07-29: EUROPA GOLD subió confianza_min a 82% (16.7% win rate previo).
+    # Activos de sesión alineados con los mejores del análisis histórico.
     SESIONES = {
         'europa': {
             'inicio': time(6, 0),
             'fin': time(10, 0),
             'nombre': 'EUROPA GOLD',
-            'confianza_min': 78.0,
-            'activos': ["EUR/USD", "GBP/USD", "EUR/GBP", "USD/CHF", "EUR/JPY", "XAU/USD"]
+            'confianza_min': 82.0,  # subido de 78 a 82 por bajo win rate histórico
+            'activos': ["EUR/JPY", "GBP/JPY", "EUR/GBP", "USD/CHF", "GBP/CHF"]
         },
         'ny': {
             'inicio': time(10, 0),
             'fin': time(13, 0),
             'nombre': 'NY POWER',
             'confianza_min': 78.0,
-            'activos': ["USD/JPY", "AUD/USD", "GBP/JPY", "CAD/JPY", "XAU/USD"]
+            'activos': ["USD/JPY", "AUD/JPY", "CAD/JPY", "NZD/USD", "USD/CHF"]
         },
         'overlap': {
             'inicio': time(13, 0),
             'fin': time(17, 0),
             'nombre': 'OVERLAP L&W',
             'confianza_min': 78.0,
-            'activos': ["EUR/GBP", "USD/CHF", "EUR/AUD", "GBP/JPY"]
+            'activos': ["AUD/JPY", "USD/JPY", "NZD/USD", "GBP/JPY", "EUR/JPY"]
         }
     }
 
