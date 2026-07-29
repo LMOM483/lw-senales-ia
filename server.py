@@ -5,6 +5,7 @@ FastAPI: sirve el frontend y expone /api/analizar para ejecutar analizar_activo 
 
 import requests as _requests
 import pandas as pd
+import ta as _ta
 import subprocess as _subprocess
 import sys as _sys
 from contextlib import asynccontextmanager
@@ -16,7 +17,7 @@ from pydantic import BaseModel
 import uvicorn
 
 from config.config import Config
-from core.indicadores import evaluar_estrategias, diagnostico
+from core.indicadores import evaluar_estrategias
 from core.sessions import TIMEZONE
 
 import os as _os
@@ -82,62 +83,216 @@ def _obtener_df(symbol: str, intervalo: str):
     except Exception:
         return None
 
+# ── Helpers de análisis para la respuesta web ────────────────────────────────
+
+def _calcular_indicadores(df: pd.DataFrame):
+    """Calcula RSI, Estocástico, EMAs y MACD. Devuelve dict con todos los valores."""
+    # EMAs
+    for p in (8, 13, 21, 50):
+        df[f"ema{p}"] = _ta.trend.EMAIndicator(df["close"], window=p).ema_indicator()
+    df["ema8_slope"]  = df["ema8"].diff()
+    df["ema13_slope"] = df["ema13"].diff()
+    curr   = df.iloc[-1]
+    precio = float(curr["close"])
+
+    alcista = (curr["ema8"] > curr["ema13"] > curr["ema21"] > curr["ema50"]
+               and precio > curr["ema50"]
+               and curr["ema8_slope"] > 0 and curr["ema13_slope"] > 0)
+    bajista = (curr["ema8"] < curr["ema13"] < curr["ema21"] < curr["ema50"]
+               and precio < curr["ema50"]
+               and curr["ema8_slope"] < 0 and curr["ema13_slope"] < 0)
+    dir_t = "CALL" if alcista else ("PUT" if bajista else None)
+
+    # RSI
+    rsi_s    = _ta.momentum.RSIIndicator(df["close"], window=Config.RSI_PERIOD).rsi()
+    rsi_val  = float(rsi_s.iloc[-1])
+    rsi_prev = float(rsi_s.iloc[-2])
+
+    # Estocástico
+    stoch  = _ta.momentum.StochasticOscillator(df["high"], df["low"], df["close"], window=14, smooth_window=3)
+    k_act  = float(stoch.stoch().iloc[-1])
+    k_prv  = float(stoch.stoch().iloc[-2])
+    d_act  = float(stoch.stoch_signal().iloc[-1])
+    d_prv  = float(stoch.stoch_signal().iloc[-2])
+    cruce_arriba = k_prv <= d_prv and k_act > d_act
+    cruce_abajo  = k_prv >= d_prv and k_act < d_act
+
+    # MACD
+    macd_obj = _ta.trend.MACD(df["close"], window_slow=26, window_fast=12, window_sign=9)
+    macd_l   = float(macd_obj.macd().iloc[-1])
+    macd_s   = float(macd_obj.macd_signal().iloc[-1])
+    dir_macd = "CALL" if macd_l > macd_s else "PUT"
+
+    return {
+        "precio": precio, "tendencia": dir_t, "macd": dir_macd,
+        "rsi": rsi_val, "rsi_prev": rsi_prev,
+        "k_act": k_act, "k_prv": k_prv, "d_act": d_act, "d_prv": d_prv,
+        "cruce_arriba": cruce_arriba, "cruce_abajo": cruce_abajo,
+    }
+
+
+def _construir_motivo(ind: dict, direccion: str, metodo: str) -> str:
+    """Construye texto legible del motivo de la señal."""
+    partes = []
+    if direccion == "CALL":
+        partes.append("Fuerza alcista confirmada")
+        if 50 <= ind["rsi"] <= 70:
+            partes.append(f"RSI activo en {ind['rsi']:.0f}")
+        if ind["cruce_arriba"]:
+            partes.append(f"Estocástico cruzó al alza (%K {ind['k_act']:.0f} > %D {ind['d_act']:.0f})")
+    else:
+        partes.append("Presión bajista confirmada")
+        if 30 <= ind["rsi"] <= 50:
+            partes.append(f"RSI en zona de venta ({ind['rsi']:.0f})")
+        if ind["cruce_abajo"]:
+            partes.append(f"Estocástico cruzó a la baja (%K {ind['k_act']:.0f} < %D {ind['d_act']:.0f})")
+    if "divergencia" in metodo:
+        partes.append("Divergencia RSI confirmada")
+    if "cruce EMA" in metodo:
+        partes.append("Cruce de medias exponenciales")
+    return " · ".join(partes) if partes else metodo
+
+
+def _que_esperar(ind: dict) -> tuple:
+    """Devuelve (lista_de_condiciones, estado) para cuando no hay señal confirmada."""
+    dir_t    = ind["tendencia"]
+    dir_macd = ind["macd"]
+    rsi      = ind["rsi"]
+    rsi_prev = ind["rsi_prev"]
+    k_act    = ind["k_act"]
+    d_act    = ind["d_act"]
+
+    if dir_t is None:
+        # Sin tendencia = lateral
+        condiciones = [
+            f"Tendencia sin dirección — EMAs sin alinear (EMA8·EMA13·EMA21·EMA50 deben ordenarse)",
+            f"RSI actual: {rsi:.1f} — esperar impulso claro por encima o por debajo de 50",
+        ]
+        return condiciones, "LATERAL"
+
+    condiciones = []
+    # RSI fuera de zona
+    if dir_t == "CALL":
+        if rsi < 50:
+            condiciones.append(f"RSI = {rsi:.1f} — necesita superar 50 para confirmar fuerza compradora")
+        elif rsi > 70:
+            condiciones.append(f"RSI = {rsi:.1f} — sobrecompra, esperar retroceso bajo 70")
+        elif rsi < rsi_prev:
+            condiciones.append(f"RSI = {rsi:.1f} cayendo — esperar que vuelva a subir")
+        # Estocástico
+        if not ind["cruce_arriba"]:
+            condiciones.append(
+                f"Estocástico: %K {k_act:.0f} vs %D {d_act:.0f} — esperar que %K cruce por encima de %D"
+            )
+        elif k_act >= 80:
+            condiciones.append(f"Estocástico sobrecomprado (%K {k_act:.0f}) — esperar retroceso bajo 80")
+    else:  # PUT
+        if rsi > 50:
+            condiciones.append(f"RSI = {rsi:.1f} — necesita bajar de 50 para confirmar presión vendedora")
+        elif rsi < 30:
+            condiciones.append(f"RSI = {rsi:.1f} — sobreventa, esperar rebote sobre 30")
+        elif rsi > rsi_prev:
+            condiciones.append(f"RSI = {rsi:.1f} subiendo — esperar que vuelva a bajar")
+        # Estocástico
+        if not ind["cruce_abajo"]:
+            condiciones.append(
+                f"Estocástico: %K {k_act:.0f} vs %D {d_act:.0f} — esperar que %K cruce por debajo de %D"
+            )
+        elif k_act <= 20:
+            condiciones.append(f"Estocástico sobrevendido (%K {k_act:.0f}) — esperar rebote sobre 20")
+
+    # MACD
+    if dir_macd != dir_t:
+        condiciones.append(f"MACD apunta {dir_macd} pero tendencia es {dir_t} — esperar alineación")
+
+    if not condiciones:
+        condiciones.append("Condiciones casi listas — aguardar cierre de la vela actual")
+
+    return condiciones, "ESPERAR"
+
+
 # ── Endpoint de análisis ─────────────────────────────────────────────────────
 
 @app.post("/api/analizar")
 def analizar_mercado(req: AnalisisRequest):
-    """Ejecuta analizar_activo en tiempo real con datos reales de Twelve Data."""
-    symbol = req.symbol.strip()
-    temporalidad = req.temporalidad  # "M1" o "M5"
-    intervalo = "1min" if temporalidad == "M1" else "5min"
-    exp_min = 1 if temporalidad == "M1" else 5
+    """Análisis on-demand: siempre devuelve estado SEÑAL, ESPERAR o LATERAL con valores reales."""
+    symbol       = req.symbol.strip()
+    temporalidad = req.temporalidad
+    intervalo    = "1min" if temporalidad == "M1" else "5min"
+    exp_min      = 1 if temporalidad == "M1" else 5
 
     # 1. Descargar datos
     df = _obtener_df(symbol, intervalo)
     if df is None:
         return JSONResponse({
-            "ok": False,
-            "error": f"No se obtuvieron datos para {symbol}. Verifica la API key o el símbolo."
+            "ok": True,
+            "estado": "ERROR",
+            "mensaje": f"No se obtuvieron datos para {symbol}. Verifica conexión o intenta de nuevo.",
         })
 
-    # 2. Diagnóstico para el log (ayuda a depurar si no hay señal)
-    diag = diagnostico(df)
-
-    # 3. Evaluar estrategias (3 capas: tendencia + momentum + MACD)
-    resultados = evaluar_estrategias(df)
-    if not resultados:
+    # 2. Calcular indicadores
+    try:
+        ind = _calcular_indicadores(df.copy())
+    except Exception as e:
         return JSONResponse({
-            "ok": False,
-            "sin_señal": True,
-            "mensaje": "El mercado no presenta confluencia técnica en este momento.",
-            "diagnostico": diag,
+            "ok": True,
+            "estado": "ERROR",
+            "mensaje": f"Error calculando indicadores: {e}",
         })
 
-    direccion, confianza, metodo = resultados[0]
+    # 3. Intentar señal con confluencia completa
+    resultados = evaluar_estrategias(df)
 
-    # 4. Calcular hora de entrada
-    ahora = datetime.now(TIMEZONE)
-    if temporalidad == "M1":
-        entrada = ahora.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    else:
-        mins_para_m5 = (5 - (ahora.minute % 5)) % 5
-        if mins_para_m5 == 0:
-            mins_para_m5 = 5
-        entrada = ahora + timedelta(minutes=mins_para_m5)
+    if resultados:
+        # ── ESTADO: SEÑAL CONFIRMADA ──────────────────────────────────────────
+        direccion, confianza, metodo = resultados[0]
+        ahora = datetime.now(TIMEZONE)
+        if temporalidad == "M1":
+            entrada = ahora.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        else:
+            mins = (5 - (ahora.minute % 5)) % 5 or 5
+            entrada = ahora + timedelta(minutes=mins)
 
-    precio = float(df["close"].iloc[-1])
+        return JSONResponse({
+            "ok": True,
+            "estado": "SEÑAL",
+            "direccion": direccion,
+            "confianza": round(confianza, 1),
+            "entrada": entrada.strftime("%H:%M:%S"),
+            "expiracion": exp_min,
+            "activo": symbol,
+            "temporalidad": temporalidad,
+            "motivo": _construir_motivo(ind, direccion, metodo),
+            "indicadores": {
+                "rsi": round(ind["rsi"], 1),
+                "stoch_k": round(ind["k_act"], 1),
+                "stoch_d": round(ind["d_act"], 1),
+                "tendencia": ind["tendencia"] or "—",
+            },
+        })
+
+    # 4. Sin señal: explicar qué falta
+    condiciones, estado = _que_esperar(ind)
+
+    # Dirección parcial: si tendencia y MACD apuntan igual, mostrar "lean"
+    lean = None
+    if ind["tendencia"] and ind["macd"] == ind["tendencia"]:
+        lean = ind["tendencia"]
 
     return JSONResponse({
         "ok": True,
-        "direccion": direccion,           # "CALL" o "PUT"
-        "confianza": round(confianza, 1), # porcentaje
-        "metodo": metodo,
-        "precio": round(precio, 5),
-        "entrada": entrada.strftime("%H:%M"),
-        "expiracion": exp_min,
-        "temporalidad": temporalidad,
-        "activo": symbol,
+        "estado": estado,   # "ESPERAR" o "LATERAL"
+        "lean": lean,       # dirección probable aunque no confirmada (puede ser None)
+        "condiciones": condiciones,
+        "indicadores": {
+            "rsi": round(ind["rsi"], 1),
+            "stoch_k": round(ind["k_act"], 1),
+            "stoch_d": round(ind["d_act"], 1),
+            "tendencia": ind["tendencia"] or "—",
+            "macd": ind["macd"],
+        },
     })
+
 
 # ── Frontend ─────────────────────────────────────────────────────────────────
 
@@ -341,20 +496,50 @@ async def index():
     .conf-bar-wrap { margin-top: 6px; background: rgba(255,255,255,.06); border-radius: 99px; height: 6px; overflow: hidden; }
     .conf-bar { height: 100%; border-radius: 99px; background: linear-gradient(90deg, var(--purple), var(--cyan)); transition: width .65s ease; }
 
-    .no-signal {
-      display: none; margin-top: 18px; padding: 20px;
-      border: 1px solid rgba(168,85,247,.3); border-radius: 15px;
-      background: rgba(168,85,247,.05);
+    /* ── Estado ESPERAR / LATERAL ── */
+    .wait-card {
+      display: none; margin-top: 18px; border-radius: 15px; overflow: hidden;
     }
-    .no-signal .ns-title { font-family:'Orbitron',sans-serif; font-size:13px; color:var(--purple); margin-bottom:8px; }
-    .no-signal p { font-size: 12px; color: var(--muted); line-height: 1.65; }
+    .wait-header {
+      padding: 16px 18px 12px;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .wait-header.esperar { background: rgba(234,179,8,.08); border: 1px solid rgba(234,179,8,.25); border-bottom: none; border-radius: 15px 15px 0 0; }
+    .wait-header.lateral { background: rgba(148,163,184,.06); border: 1px solid rgba(148,163,184,.2); border-bottom: none; border-radius: 15px 15px 0 0; }
+    .wait-icon { font-size: 22px; line-height:1; }
+    .wait-title { font-family:'Orbitron',sans-serif; font-size:12px; letter-spacing:.5px; }
+    .wait-title.esperar { color: #eab308; }
+    .wait-title.lateral { color: var(--muted); }
+    .wait-lean { font-size: 10px; color: rgba(148,163,184,.6); margin-top: 2px; }
+    .wait-body { padding: 14px 18px 18px; border-radius: 0 0 15px 15px; }
+    .wait-body.esperar { background: rgba(234,179,8,.04); border: 1px solid rgba(234,179,8,.25); border-top: none; }
+    .wait-body.lateral { background: rgba(148,163,184,.03); border: 1px solid rgba(148,163,184,.2); border-top: none; }
+
+    .wait-indic-row {
+      display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap;
+    }
+    .wi-pill {
+      background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.09);
+      border-radius: 8px; padding: 6px 10px; text-align: center; flex: 1; min-width: 60px;
+    }
+    .wi-label { font-size: 9px; color: rgba(148,163,184,.5); text-transform: uppercase; letter-spacing:.8px; }
+    .wi-val   { font-size: 14px; font-weight: 700; color: #fff; margin-top: 2px; }
+
+    .wait-conditions { list-style: none; padding: 0; margin: 0; }
+    .wait-conditions li {
+      font-size: 11px; color: var(--muted); line-height: 1.6;
+      padding: 5px 0 5px 16px; position: relative; border-bottom: 1px solid rgba(255,255,255,.04);
+    }
+    .wait-conditions li:last-child { border-bottom: none; }
+    .wait-conditions li::before { content: '▸'; position: absolute; left: 0; color: #eab308; font-size: 10px; top: 6px; }
+    .wait-conditions li.lateral-bullet::before { color: var(--muted); }
 
     .error-msg {
       display: none; margin-top: 14px; padding: 13px 15px; border-radius: 11px;
       background: rgba(239,68,68,.07); border: 1px solid rgba(239,68,68,.3);
       font-size: 12px; color: #fca5a5;
     }
-    .metodo-txt { font-size: 10px; color: rgba(148,163,184,.45); margin-top: 10px; font-style: italic; }
+    .motivo-txt { font-size: 11px; color: rgba(148,163,184,.55); margin-top: 12px; line-height: 1.55; border-top: 1px solid rgba(255,255,255,.06); padding-top: 10px; }
 
     /* ═══ DISCLAIMER ═══ */
     .disclaimer {
@@ -585,24 +770,25 @@ async def index():
       <div id="scanner-signal" class="scanner-screen">
         <div id="loading-wrap" class="spinner-wrap">
           <div class="spinner"></div>
-          <div class="spinner-text">Escaneando con IA · Twelve Data...</div>
+          <div class="spinner-text">Consultando Twelve Data en tiempo real...</div>
         </div>
 
-        <div id="signal-card" class="signal-card">
+        <!-- ── Estado: SEÑAL CONFIRMADA ── -->
+        <div id="signal-card" class="signal-card" style="display:none">
           <div class="signal-direction" id="sig-direction">COMPRA ↑</div>
           <div class="signal-pair" id="sig-pair">EUR/USD · M5</div>
           <div class="data-grid">
             <div class="data-cell">
-              <div class="dc-label">Entrada</div>
-              <div class="dc-value cyan" id="sig-entrada">--:--</div>
+              <div class="dc-label">Entrada exacta</div>
+              <div class="dc-value cyan" id="sig-entrada">--:--:--</div>
             </div>
             <div class="data-cell">
               <div class="dc-label">Expiración</div>
               <div class="dc-value" id="sig-exp">-- min</div>
             </div>
             <div class="data-cell">
-              <div class="dc-label">Precio actual</div>
-              <div class="dc-value" id="sig-precio">--.-----</div>
+              <div class="dc-label">RSI</div>
+              <div class="dc-value purple" id="sig-rsi">--</div>
             </div>
             <div class="data-cell">
               <div class="dc-label">Confluencia</div>
@@ -615,18 +801,44 @@ async def index():
               </div>
             </div>
           </div>
-          <div class="metodo-txt" id="sig-metodo"></div>
+          <div class="motivo-txt" id="sig-motivo"></div>
         </div>
 
-        <div id="no-signal" class="no-signal">
-          <div class="ns-title">⏳ Sin confluencia ahora</div>
-          <p id="no-signal-msg">El mercado no presenta condiciones técnicas claras. Intenta en unos minutos o cambia de par.</p>
-          <div id="no-signal-diag" style="margin-top:10px;padding:8px 10px;background:rgba(255,255,255,.04);border-radius:8px;font-size:10px;color:rgba(148,163,184,.6);line-height:1.8;display:none;text-align:left;font-family:monospace;"></div>
+        <!-- ── Estado: ESPERAR / LATERAL ── -->
+        <div id="wait-card" class="wait-card">
+          <div class="wait-header" id="wait-header">
+            <div class="wait-icon" id="wait-icon">🟡</div>
+            <div>
+              <div class="wait-title" id="wait-title">ESPERAR</div>
+              <div class="wait-lean" id="wait-lean"></div>
+            </div>
+          </div>
+          <div class="wait-body" id="wait-body">
+            <div class="wait-indic-row">
+              <div class="wi-pill">
+                <div class="wi-label">RSI</div>
+                <div class="wi-val" id="wi-rsi">--</div>
+              </div>
+              <div class="wi-pill">
+                <div class="wi-label">%K</div>
+                <div class="wi-val" id="wi-k">--</div>
+              </div>
+              <div class="wi-pill">
+                <div class="wi-label">%D</div>
+                <div class="wi-val" id="wi-d">--</div>
+              </div>
+              <div class="wi-pill">
+                <div class="wi-label">Tendencia</div>
+                <div class="wi-val" id="wi-tend" style="font-size:11px">--</div>
+              </div>
+            </div>
+            <ul class="wait-conditions" id="wait-conditions"></ul>
+          </div>
         </div>
 
         <div id="error-msg" class="error-msg"></div>
 
-        <button class="btn btn-secondary" onclick="backToConfig()">← Nuevo análisis</button>
+        <button class="btn btn-secondary" style="margin-top:18px" onclick="backToConfig()">← Nuevo análisis</button>
 
         <div class="disclaimer">
           Análisis técnico generado en tiempo real sobre mercado Forex oficial.
@@ -966,11 +1178,12 @@ async def index():
   function resetSignal() {
     document.getElementById('loading-wrap').style.display = 'flex';
     document.getElementById('signal-card').style.display  = 'none';
-    document.getElementById('no-signal').style.display    = 'none';
+    document.getElementById('wait-card').style.display    = 'none';
     document.getElementById('error-msg').style.display    = 'none';
+    document.getElementById('conf-bar').style.width       = '0%';
   }
 
-  /* ── Análisis ── */
+  /* ── Análisis on-demand ── */
   async function startAnalysis() {
     const symbol       = document.getElementById('market-select').value;
     const temporalidad = document.getElementById('time-select').value;
@@ -985,46 +1198,81 @@ async def index():
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       const data = await resp.json();
       document.getElementById('loading-wrap').style.display = 'none';
-      if (!data.ok && data.sin_señal) {
-        document.getElementById('no-signal-msg').textContent =
-          data.mensaje || 'Sin confluencia técnica en este momento.';
-        const diagEl = document.getElementById('no-signal-diag');
-        if (data.diagnostico) {
-          diagEl.textContent = '🔎 ' + data.diagnostico;
-          diagEl.style.display = 'block';
-        } else {
-          diagEl.style.display = 'none';
-        }
-        document.getElementById('no-signal').style.display = 'block';
-        return;
-      }
-      if (!data.ok) {
-        document.getElementById('error-msg').textContent = '⚠️ ' + (data.error || 'Error desconocido.');
+
+      if (data.estado === 'SEÑAL') {
+        renderSignal(data);
+      } else if (data.estado === 'ESPERAR' || data.estado === 'LATERAL') {
+        renderEsperar(data);
+      } else {
+        // ERROR u otro estado inesperado
+        document.getElementById('error-msg').textContent =
+          '⚠️ ' + (data.mensaje || 'No se pudo obtener datos. Intenta de nuevo.');
         document.getElementById('error-msg').style.display = 'block';
-        return;
       }
-      renderSignal(data);
     } catch (err) {
       document.getElementById('loading-wrap').style.display = 'none';
-      document.getElementById('error-msg').textContent = '⚠️ No se pudo conectar con el servidor. ' + err.message;
+      document.getElementById('error-msg').textContent =
+        '⚠️ Sin conexión con el servidor. Intenta de nuevo. (' + err.message + ')';
       document.getElementById('error-msg').style.display = 'block';
     }
   }
 
   function renderSignal(d) {
-    const card = document.getElementById('signal-card');
+    const card   = document.getElementById('signal-card');
     const isCall = d.direccion === 'CALL';
     card.className = 'signal-card ' + (isCall ? 'signal-call' : 'signal-put');
-    document.getElementById('sig-direction').textContent = isCall ? '🟢 COMPRA (CALL) ↑' : '🔴 VENTA (PUT) ↓';
+    document.getElementById('sig-direction').textContent =
+      isCall ? '🟢 COMPRA (CALL)  ↑' : '🔴 VENTA (PUT)  ↓';
     document.getElementById('sig-pair').textContent    = d.activo + ' · ' + d.temporalidad;
     document.getElementById('sig-entrada').textContent = d.entrada;
     document.getElementById('sig-exp').textContent     = d.expiracion + ' min';
-    document.getElementById('sig-precio').textContent  = d.precio.toFixed(5);
+    document.getElementById('sig-rsi').textContent     = (d.indicadores && d.indicadores.rsi != null)
+      ? d.indicadores.rsi.toFixed(1) : '--';
     document.getElementById('sig-conf').textContent    = d.confianza.toFixed(1) + '%';
     document.getElementById('sig-conf').className      = 'dc-value ' + (isCall ? 'green' : 'red');
-    document.getElementById('sig-metodo').textContent  = '🔎 ' + d.metodo;
+    document.getElementById('sig-motivo').textContent  = '📊 ' + (d.motivo || '');
     setTimeout(() => { document.getElementById('conf-bar').style.width = d.confianza + '%'; }, 100);
     card.style.display = 'block';
+  }
+
+  function renderEsperar(d) {
+    const isLateral = d.estado === 'LATERAL';
+    const cls       = isLateral ? 'lateral' : 'esperar';
+
+    // Header
+    document.getElementById('wait-icon').textContent = isLateral ? '⚪' : '🟡';
+    const titleEl = document.getElementById('wait-title');
+    titleEl.textContent = isLateral ? 'MERCADO LATERAL — ESPERAR' : 'ESPERAR CONFIRMACIÓN';
+    titleEl.className = 'wait-title ' + cls;
+    document.getElementById('wait-header').className = 'wait-header ' + cls;
+    document.getElementById('wait-body').className   = 'wait-body '   + cls;
+
+    // Lean (dirección probable)
+    const leanEl = document.getElementById('wait-lean');
+    if (d.lean) {
+      leanEl.textContent = 'Sesgo probable: ' + (d.lean === 'CALL' ? '↑ Alcista' : '↓ Bajista');
+    } else {
+      leanEl.textContent = 'Sin sesgo definido aún';
+    }
+
+    // Indicadores
+    const ind = d.indicadores || {};
+    document.getElementById('wi-rsi').textContent  = ind.rsi  != null ? ind.rsi.toFixed(1)  : '--';
+    document.getElementById('wi-k').textContent    = ind.stoch_k != null ? ind.stoch_k.toFixed(1) : '--';
+    document.getElementById('wi-d').textContent    = ind.stoch_d != null ? ind.stoch_d.toFixed(1) : '--';
+    document.getElementById('wi-tend').textContent = ind.tendencia || '—';
+
+    // Condiciones a esperar
+    const ul = document.getElementById('wait-conditions');
+    ul.innerHTML = '';
+    (d.condiciones || ['Sin datos de condiciones.']).forEach(c => {
+      const li = document.createElement('li');
+      if (isLateral) li.className = 'lateral-bullet';
+      li.textContent = c;
+      ul.appendChild(li);
+    });
+
+    document.getElementById('wait-card').style.display = 'block';
   }
 
   /* ── Academia acordeón ── */
