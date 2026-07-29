@@ -6,8 +6,16 @@ Detienes: CTRL + C
 """
 import sys
 import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+# Forzar UTF-8 solo si stdout tiene buffer (terminal local).
+# En Railway/subprocess sin buffer asignado, se omite para no crashear.
+try:
+    if hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
+    if hasattr(sys.stderr, "buffer"):
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", line_buffering=True)
+except Exception:
+    pass
 
 import time
 import os

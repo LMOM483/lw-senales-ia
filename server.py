@@ -33,13 +33,13 @@ async def lifespan(app: FastAPI):
     global _bot_proceso
     try:
         _bot_proceso = _subprocess.Popen(
-            [_sys.executable, "main.py"],
-            stdout=_subprocess.DEVNULL,
-            stderr=_subprocess.DEVNULL,
+            [_sys.executable, "-u", "main.py"],
+            stdout=None,   # hereda stdout de uvicorn → Railway captura los logs
+            stderr=None,   # hereda stderr de uvicorn → Railway captura los errores
         )
-        print(f"[LW] Bot de Telegram iniciado (PID {_bot_proceso.pid})")
+        print(f"[LW] Bot de Telegram iniciado (PID {_bot_proceso.pid})", flush=True)
     except Exception as e:
-        print(f"[LW] No se pudo iniciar main.py: {e}")
+        print(f"[LW] No se pudo iniciar main.py: {e}", flush=True)
     yield
     # Al apagar el servidor, terminar el bot también
     if _bot_proceso and _bot_proceso.poll() is None:
