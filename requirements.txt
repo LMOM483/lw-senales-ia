@@ -1,0 +1,29 @@
+# L&W PREMIUM IA SIGNS — dependencias de producción
+# Generado para despliegue en Render / Railway (Python 3.11+)
+
+# ── Web server ──────────────────────────────────────────────────────────────
+fastapi==0.135.2
+uvicorn==0.42.0
+starlette==1.0.0
+pydantic==2.12.5
+h11==0.16.0
+anyio==4.9.0
+
+# ── HTTP & datos de mercado ──────────────────────────────────────────────────
+requests==2.32.3
+websocket-client==1.8.0
+websockets==15.0.1
+
+# ── Análisis técnico ─────────────────────────────────────────────────────────
+pandas==2.2.3
+numpy==2.2.6
+ta==0.11.0
+
+# ── Configuración & utilidades ───────────────────────────────────────────────
+python-dotenv==1.1.0
+pytz==2025.2
+tzdata==2025.2
+
+# ── Telegram (bot principal main.py) ────────────────────────────────────────
+pyTelegramBotAPI==4.31.0
+python-json-logger==2.0.7

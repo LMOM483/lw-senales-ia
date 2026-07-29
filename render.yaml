@@ -1,0 +1,39 @@
+# render.yaml — Configuración de despliegue para Render.com
+# Documentación: https://render.com/docs/render-yaml-configuration
+#
+# IMPORTANTE: Las variables de entorno marcadas como sync: false
+# deben cargarse manualmente en el Dashboard de Render
+# (Environment → Add Environment Variable).
+# NUNCA subas el archivo .env al repositorio.
+
+services:
+  - type: web
+    name: lw-premium-ia-signs
+    runtime: python
+    region: oregon            # cambia a "frankfurt" si tus usuarios son de Europa
+    plan: free                # cambia a "starter" ($7/mes) para uptime 24/7 real
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+
+    envVars:
+      # ── API Keys (cargar en el Dashboard, NO hardcodear) ──────────────────
+      - key: TWELVE_DATA_API_KEY
+        sync: false           # carga manual en Render Dashboard → Environment
+
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+
+      - key: TELEGRAM_CHAT_ID_GRATIS
+        sync: false
+
+      - key: TELEGRAM_CHAT_ID_VIP
+        sync: false
+
+      # ── Modo de operación ─────────────────────────────────────────────────
+      - key: MODO_DESARROLLO
+        value: "false"        # false = canal GRATIS activo en producción
+
+      # ── Python ───────────────────────────────────────────────────────────
+      - key: PYTHON_VERSION
+        value: "3.11.9"

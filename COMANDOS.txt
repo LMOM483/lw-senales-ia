@@ -1,0 +1,62 @@
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                   COMANDOS DIARIOS - TRADEXO BOT                              ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+┌──────────────────┬──────────────────────────────────────┬──────────────────────┐
+│ ACCIÓN           │ COMANDO                              │ DEBE MOSTRAR         │
+├──────────────────┼──────────────────────────────────────┼──────────────────────┤
+│ Navegar carpeta  │ cd C:\Users\RaidenShg\Desktop\      │ C:\Users\...\        │
+│ principal        │ tradexo-quotex-pro                  │ tradexo-quotex-pro   │
+├──────────────────┼──────────────────────────────────────┼──────────────────────┤
+│ Verificar        │ python --version                     │ Python 3.13.3        │
+│ Python           │                                      │ (o versión similar)  │
+├──────────────────┼──────────────────────────────────────┼──────────────────────┤
+│ Verificar        │ pip list | find "requests"           │ requests 2.32.3      │
+│ librerías        │                                      │ (y otras instaladas) │
+├──────────────────┼──────────────────────────────────────┼──────────────────────┤
+│ Probar Config    │ python -c "from config.config        │ America/Sao_Paulo    │
+│                  │ import Config; print               │ 1.0                  │
+│                  │ (Config.TIMEZONE);                 │                      │
+│                  │ print(Config.INVESTMENT_FIXED)"    │                      │
+├──────────────────┼──────────────────────────────────────┼──────────────────────┤
+│ Probar Database  │ python -c "from config.database     │ ✅ Conectado         │
+│                  │ import Database; db = Database();   │ ✅ Tablas creadas    │
+│                  │ db.crear_tablas(); db.cerrar()"    │ ✅ Conexión cerrada  │
+├──────────────────┼──────────────────────────────────────┼──────────────────────┤
+│ Probar Telegram  │ python -c "from core.telegram       │ (Sin error)          │
+│                  │ import notifier;                    │ + Mensaje en Telegram│
+│                  │ notifier.test_conexion()"          │                      │
+├──────────────────┼──────────────────────────────────────┼──────────────────────┤
+│ EJECUTAR BOT     │ python -m core.bot                  │ 🔥 TRADEXO BOT       │
+│ (PRINCIPAL)      │                                      │ INICIADO             │
+│                  │                                      │ ✅ Analizando...     │
+├──────────────────┼──────────────────────────────────────┼──────────────────────┤
+│ Ver estructura   │ tree /F                              │ Todas las carpetas   │
+│                  │                                      │ y archivos           │
+├──────────────────┼──────────────────────────────────────┼──────────────────────┤
+│ Ver logs         │ type logs\tradexo.log                │ Historial de eventos │
+│                  │                                      │ (si existen)         │
+└──────────────────┴──────────────────────────────────────┴──────────────────────┘
+
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                         ORDEN RECOMENDADO                                      ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+MAÑANA A LAS 6 AM (RUTINA DIARIA):
+
+1️⃣  cd C:\Users\RaidenShg\Desktop\tradexo-quotex-pro
+2️⃣  python --version           (verificar que Python funciona)
+3️⃣  python -m core.bot         (EJECUTAR BOT - EL PRINCIPAL)
+
+ESO ES TODO.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+NOTA IMPORTANTE:
+
+- El bot está configurado para enviar señales AUTOMÁTICAMENTE
+- GRATIS: Máximo 3 señales/día
+- VIP: Todas las señales (hasta 12/día)
+- Telegram: Envía a los dos canales simultáneamente
+
+═══════════════════════════════════════════════════════════════════════════════
