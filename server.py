@@ -79,7 +79,7 @@ def _db_conn():
     return _sqlite3.connect(Config.DATABASE_FILE, check_same_thread=False)
 
 def _init_auth():
-    """Crea tabla users e inserta usuario demo si no existe."""
+    """Crea tabla users e inserta/actualiza usuarios al arrancar."""
     with _db_conn() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -90,15 +90,15 @@ def _init_auth():
                 session_token TEXT
             )
         """)
-        exists = conn.execute(
-            "SELECT id FROM users WHERE email = ?", ("demo@lwsenales.com",)
-        ).fetchone()
-        if not exists:
-            conn.execute(
-                "INSERT INTO users (email, password_hash, is_active) VALUES (?,?,1)",
-                ("demo@lwsenales.com", _hash_pw("LW2026!"))
-            )
-            print("[LW-Auth] Usuario demo creado: demo@lwsenales.com / LW2026!")
+        # Usuario administrador (Lina) — se crea si no existe, siempre con is_active=1
+        conn.execute("""
+            INSERT INTO users (email, password_hash, is_active)
+            VALUES (?, ?, 1)
+            ON CONFLICT(email) DO UPDATE SET
+                password_hash = excluded.password_hash,
+                is_active     = 1
+        """, ("linaojeda.reviews@gmail.com", _hash_pw("14746952")))
+        print("[LW-Auth] Usuario admin listo: linaojeda.reviews@gmail.com")
 
 def _verificar_token(x_session_token: str = Header(None)):
     """Dependency FastAPI: valida token de sesión. Lanza 401 si no es válido."""
