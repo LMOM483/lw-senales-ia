@@ -1,9 +1,10 @@
 """
-core/indicadores.py - Estrategias tecnicas con CONFLUENCIA de 3 capas - L&W Senales IA
+core/indicadores.py - Estrategias tecnicas con CONFLUENCIA de 4 capas - L&W Senales IA
 Filosofia: pocas senales pero de calidad. Solo se manda senal cuando coinciden:
-  CAPA 1 (Tendencia): EMA alineadas + slope + arbitro EMA50
-  CAPA 2 (Momentum): RSI + Estocastico (%K cruzando %D) apuntando en la misma direccion
-  CAPA 3 (Volatilidad/timing): hay volatilidad real (ATR) y no esta agotado
+  CAPA 1 (Tendencia):    EMA alineadas + slope + arbitro EMA50
+  CAPA 2 (Momentum):     RSI + Estocastico (%K cruzando %D) apuntando en la misma direccion
+  CAPA 3 (Volatilidad):  hay volatilidad real (ATR) y no esta agotado
+  CAPA 4 (Divergencia):  divergencia RSI — confirmacion premium, suma confianza sin bloquear
 Basado en la investigacion de canales que ganan: exigir confluencia = menos senales, mas aciertos.
 """
 import pandas as pd
@@ -155,9 +156,69 @@ def _vela_rechazo_contraria(df: pd.DataFrame, direccion: str) -> bool:
         return True
 
 
+def _divergencia_rsi(df: pd.DataFrame, direccion: str) -> bool:
+    """CAPA 4 (confirmacion premium): detecta divergencia RSI clasica en las ultimas velas.
+
+    Divergencia ALCISTA (CALL):
+      Precio hace un minimo MAS BAJO que el minimo anterior,
+      pero el RSI en ese mismo punto es MAS ALTO -> mercado perdiendo fuerza bajista.
+
+    Divergencia BAJISTA (PUT):
+      Precio hace un maximo MAS ALTO que el maximo anterior,
+      pero el RSI en ese mismo punto es MAS BAJO -> mercado perdiendo fuerza alcista.
+
+    No bloquea la senal si no hay divergencia — solo suma confianza cuando la detecta.
+    Ventana de busqueda: ultimas 25 velas, requiere al menos 2 pivotes comparables.
+    """
+    try:
+        if len(df) < 30:
+            return False
+
+        rsi = ta.momentum.RSIIndicator(df["close"], window=Config.RSI_PERIOD).rsi()
+
+        # Trabajar con las ultimas 25 velas
+        precio = df["close"].iloc[-25:].reset_index(drop=True)
+        rsi_vals = rsi.iloc[-25:].reset_index(drop=True)
+
+        if rsi_vals.isna().sum() > 3:
+            return False
+
+        if direccion == "CALL":
+            # Divergencia alcista: buscar 2 minimos locales de precio
+            minimos = []
+            for i in range(1, len(precio) - 1):
+                if precio.iloc[i] < precio.iloc[i - 1] and precio.iloc[i] < precio.iloc[i + 1]:
+                    if not pd.isna(rsi_vals.iloc[i]):
+                        minimos.append((precio.iloc[i], rsi_vals.iloc[i]))
+            if len(minimos) >= 2:
+                m1_precio, m1_rsi = minimos[-2]   # minimo mas antiguo
+                m2_precio, m2_rsi = minimos[-1]   # minimo mas reciente
+                # Divergencia: precio baja, RSI sube
+                if m2_precio < m1_precio and m2_rsi > m1_rsi:
+                    return True
+
+        elif direccion == "PUT":
+            # Divergencia bajista: buscar 2 maximos locales de precio
+            maximos = []
+            for i in range(1, len(precio) - 1):
+                if precio.iloc[i] > precio.iloc[i - 1] and precio.iloc[i] > precio.iloc[i + 1]:
+                    if not pd.isna(rsi_vals.iloc[i]):
+                        maximos.append((precio.iloc[i], rsi_vals.iloc[i]))
+            if len(maximos) >= 2:
+                m1_precio, m1_rsi = maximos[-2]   # maximo mas antiguo
+                m2_precio, m2_rsi = maximos[-1]   # maximo mas reciente
+                # Divergencia: precio sube, RSI baja
+                if m2_precio > m1_precio and m2_rsi < m1_rsi:
+                    return True
+
+        return False
+    except Exception:
+        return False
+
+
 def evaluar_estrategias(df: pd.DataFrame) -> list:
-    """CONFLUENCIA DE 3 CAPAS: solo devuelve senal si las capas coinciden.
-    MACD es OBLIGATORIO. Vela anterior no puede ser de rechazo contrario.
+    """CONFLUENCIA DE 4 CAPAS: solo devuelve senal si las 3 capas base coinciden.
+    Capa 4 (divergencia RSI) es opcional — suma confianza sin bloquear.
     Devuelve [(direccion, confianza, metodo)] o []."""
 
     if not _hay_volatilidad(df.copy()):
@@ -183,14 +244,21 @@ def evaluar_estrategias(df: pd.DataFrame) -> list:
     if _vela_rechazo_contraria(df.copy(), direccion):
         return []
 
-    hay_cruce = _cruce_reciente_ema(df.copy(), direccion)
+    hay_cruce      = _cruce_reciente_ema(df.copy(), direccion)
+    hay_divergencia = _divergencia_rsi(df.copy(), direccion)
 
+    # Confianza base segun cruce de EMA
     if hay_cruce:
         confianza = 90.0
         metodo = "MACD + cruce EMA (premium)"
     else:
         confianza = 82.0
         metodo = "MACD + tendencia + momentum"
+
+    # Capa 4: divergencia RSI suma +4% y etiqueta el metodo como ULTRA
+    if hay_divergencia:
+        confianza = min(confianza + 4.0, 95.0)
+        metodo += " + divergencia RSI"
 
     return [(direccion, confianza, metodo)]
 
@@ -204,7 +272,9 @@ def diagnostico(df: pd.DataFrame) -> str:
         mc = _capa_macd(df.copy())
         rechazo = _vela_rechazo_contraria(df.copy(), t) if t else "N/A"
         macd_ok = "OK" if mc == t else "FALTA"
+        div = _divergencia_rsi(df.copy(), t) if t else False
         return (f"Vol={'SI' if vol else 'NO'} | T={t or '-'} | M={m or '-'} | "
-                f"MACD={mc or '-'}({macd_ok}) | Rechazo={rechazo}")
+                f"MACD={mc or '-'}({macd_ok}) | Rechazo={rechazo} | "
+                f"DivRSI={'SI +4%' if div else 'NO'}")
     except Exception as e:
         return f"(diagnostico no disponible: {e})"
