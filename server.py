@@ -58,8 +58,11 @@ class AnalisisRequest(BaseModel):
 
 # ── Función de datos (sync, reutiliza la misma lógica del bot) ───────────────
 
+_IND_VACIO = {"rsi": None, "stoch_k": None, "stoch_d": None, "tendencia": "—", "macd": None}
+
 def _obtener_df(symbol: str, intervalo: str):
-    """Descarga velas de Twelve Data y devuelve DataFrame en orden cronológico, o None."""
+    """Descarga velas de Twelve Data.
+    Retorna (df, None) en éxito, (None, 'rate_limit') en 429, (None, 'error') en otro fallo."""
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
@@ -70,18 +73,20 @@ def _obtener_df(symbol: str, intervalo: str):
     }
     try:
         resp = _requests.get(url, params=params, timeout=12)
+        if resp.status_code == 429:
+            return None, "rate_limit"
         if resp.status_code != 200:
-            return None
+            return None, "error"
         data = resp.json()
         if "values" not in data or len(data["values"]) < 55:
-            return None
+            return None, "error"
         df = pd.DataFrame(data["values"])
         for col in ("open", "high", "low", "close"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["close"]).sort_values("datetime").reset_index(drop=True)
-        return df
+        return df, None
     except Exception:
-        return None
+        return None, "error"
 
 # ── Helpers de análisis para la respuesta web ────────────────────────────────
 
@@ -233,11 +238,16 @@ def analizar_mercado(req: AnalisisRequest):
     intervalo    = "1min" if temporalidad == "M1" else "5min"
     exp_min      = 1 if temporalidad == "M1" else 5
 
-    # Plantilla base que garantiza que todos los campos numéricos estén presentes
-    _IND_VACIO = {"rsi": None, "stoch_k": None, "stoch_d": None, "tendencia": "—", "macd": None}
-
     # 1. Descargar datos
-    df = _obtener_df(symbol, intervalo)
+    df, api_err = _obtener_df(symbol, intervalo)
+    if api_err == "rate_limit":
+        return JSONResponse({
+            "ok": True,
+            "estado": "ERROR",
+            "mensaje": "⚠️ Límite de peticiones a Twelve Data. Espera unos segundos e intenta de nuevo.",
+            "condiciones": ["La API de datos está temporalmente saturada. Reintentar en 15-30 segundos."],
+            "indicadores": _IND_VACIO,
+        })
     if df is None:
         return JSONResponse({
             "ok": True,
@@ -326,9 +336,21 @@ def top_assets(intervalo: str = "5min"):
         return JSONResponse({"status": "success", "cached": True, "top_assets": cached["data"]})
 
     resultados = []
+    hubo_rate_limit = False
     for simbolo in Config.POOL_FOREX:
         try:
-            df = _obtener_df(simbolo, intervalo)
+            df, api_err = _obtener_df(simbolo, intervalo)
+            if api_err == "rate_limit":
+                hubo_rate_limit = True
+                resultados.append({
+                    "symbol": simbolo,
+                    "confluence": None,
+                    "signal": "API_LIMIT",
+                    "confirmed": False,
+                    "status_label": "⚠️ Sin datos — Reintentar",
+                    "reason": "Límite de peticiones alcanzado",
+                })
+                continue
             if df is None:
                 continue
             ind = _calcular_indicadores(df.copy())
@@ -389,9 +411,15 @@ def top_assets(intervalo: str = "5min"):
         except Exception:
             continue
 
-    resultados.sort(key=lambda x: x["confluence"], reverse=True)
+    # Ordenar: confluence None al final (activos con rate_limit)
+    resultados.sort(key=lambda x: x["confluence"] if x["confluence"] is not None else -1, reverse=True)
     _scanner_cache[intervalo] = {"ts": ahora_ts, "data": resultados}
-    return JSONResponse({"status": "success", "cached": False, "top_assets": resultados})
+    return JSONResponse({
+        "status": "success",
+        "cached": False,
+        "rate_limited": hubo_rate_limit,
+        "top_assets": resultados,
+    })
 
 
 # ── Frontend ─────────────────────────────────────────────────────────────────
@@ -1465,9 +1493,13 @@ async def index():
       loadTxt.style.display = 'none';
       if (data.status === 'success') {
         renderTopAssets(data.top_assets);
-        noteEl.textContent = data.cached
-          ? '✦ Resultado desde caché (actualiza en <60 s)'
-          : '✦ Datos en tiempo real · Twelve Data';
+        if (data.rate_limited) {
+          noteEl.textContent = '⚠️ Algunos activos no cargaron por límite de API. Espera 30 s y reescanea.';
+        } else {
+          noteEl.textContent = data.cached
+            ? '✦ Resultado desde caché (actualiza en <60 s)'
+            : '✦ Datos en tiempo real · Twelve Data';
+        }
       } else {
         listEl.innerHTML = '<div class="scan-empty">⚠️ Error al escanear. Intenta de nuevo.</div>';
       }
@@ -1501,16 +1533,28 @@ async def index():
 
       const pill = document.createElement('div');
       pill.className = 'asset-pill';
+      // data-symbol en el elemento raíz: garantiza símbolo correcto sin importar dónde haga clic
+      pill.setAttribute('data-symbol', a.symbol || '');
+
+      const isApiLimit = a.signal === 'API_LIMIT';
       pill.innerHTML =
         '<div class="ap-left">' +
           '<div class="ap-symbol">' + (a.symbol || '') + '</div>' +
           '<div class="ap-reason">' + (a.reason || '') + '</div>' +
         '</div>' +
         '<div class="ap-right">' +
-          '<div class="ap-badge ' + badgeCls + '">' + confLabel + '</div>' +
+          '<div class="ap-badge ' + (isApiLimit ? 'flat' : badgeCls) + '">' + (isApiLimit ? '⚠️' : confLabel) + '</div>' +
           '<div class="ap-label">' + (a.status_label || '') + '</div>' +
         '</div>';
-      pill.addEventListener('click', () => selectTopAsset(a.symbol));
+
+      if (!isApiLimit) {
+        // e.currentTarget siempre apunta al pill (el que tiene el listener),
+        // aunque el clic venga de un elemento hijo
+        pill.addEventListener('click', (e) => {
+          const sym = e.currentTarget.getAttribute('data-symbol');
+          if (sym) selectTopAsset(sym);
+        });
+      }
       listEl.appendChild(pill);
     });
   }
