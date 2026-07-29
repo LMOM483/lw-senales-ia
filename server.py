@@ -221,6 +221,9 @@ def analizar_mercado(req: AnalisisRequest):
     intervalo    = "1min" if temporalidad == "M1" else "5min"
     exp_min      = 1 if temporalidad == "M1" else 5
 
+    # Plantilla base que garantiza que todos los campos numéricos estén presentes
+    _IND_VACIO = {"rsi": None, "stoch_k": None, "stoch_d": None, "tendencia": "—", "macd": None}
+
     # 1. Descargar datos
     df = _obtener_df(symbol, intervalo)
     if df is None:
@@ -228,6 +231,8 @@ def analizar_mercado(req: AnalisisRequest):
             "ok": True,
             "estado": "ERROR",
             "mensaje": f"No se obtuvieron datos para {symbol}. Verifica conexión o intenta de nuevo.",
+            "condiciones": ["Sin datos del servidor. Intenta de nuevo en unos segundos."],
+            "indicadores": _IND_VACIO,
         })
 
     # 2. Calcular indicadores
@@ -238,7 +243,21 @@ def analizar_mercado(req: AnalisisRequest):
             "ok": True,
             "estado": "ERROR",
             "mensaje": f"Error calculando indicadores: {e}",
+            "condiciones": ["Error interno al procesar los datos. Intenta de nuevo."],
+            "indicadores": _IND_VACIO,
         })
+
+    # Bloque de indicadores siempre completo (valores redondeados, nunca None en los numéricos)
+    def _ind_bloque(inc_macd: bool = False):
+        bloque = {
+            "rsi":       round(float(ind["rsi"]),   1),
+            "stoch_k":   round(float(ind["k_act"]), 1),
+            "stoch_d":   round(float(ind["d_act"]), 1),
+            "tendencia": ind["tendencia"] or "—",
+        }
+        if inc_macd:
+            bloque["macd"] = ind["macd"] or "—"
+        return bloque
 
     # 3. Intentar señal con confluencia completa
     resultados = evaluar_estrategias(df)
@@ -257,40 +276,28 @@ def analizar_mercado(req: AnalisisRequest):
             "ok": True,
             "estado": "SEÑAL",
             "direccion": direccion,
-            "confianza": round(confianza, 1),
+            "confianza": round(float(confianza), 1),
             "entrada": entrada.strftime("%H:%M:%S"),
             "expiracion": exp_min,
             "activo": symbol,
             "temporalidad": temporalidad,
             "motivo": _construir_motivo(ind, direccion, metodo),
-            "indicadores": {
-                "rsi": round(ind["rsi"], 1),
-                "stoch_k": round(ind["k_act"], 1),
-                "stoch_d": round(ind["d_act"], 1),
-                "tendencia": ind["tendencia"] or "—",
-            },
+            "indicadores": _ind_bloque(),
         })
 
     # 4. Sin señal: explicar qué falta
     condiciones, estado = _que_esperar(ind)
 
-    # Dirección parcial: si tendencia y MACD apuntan igual, mostrar "lean"
     lean = None
     if ind["tendencia"] and ind["macd"] == ind["tendencia"]:
         lean = ind["tendencia"]
 
     return JSONResponse({
         "ok": True,
-        "estado": estado,   # "ESPERAR" o "LATERAL"
-        "lean": lean,       # dirección probable aunque no confirmada (puede ser None)
+        "estado": estado,
+        "lean": lean,
         "condiciones": condiciones,
-        "indicadores": {
-            "rsi": round(ind["rsi"], 1),
-            "stoch_k": round(ind["k_act"], 1),
-            "stoch_d": round(ind["d_act"], 1),
-            "tendencia": ind["tendencia"] or "—",
-            "macd": ind["macd"],
-        },
+        "indicadores": _ind_bloque(inc_macd=True),
     })
 
 
@@ -1217,29 +1224,36 @@ async def index():
     }
   }
 
+  /* ── Helper seguro para formatear números (evita crash con undefined/null) ── */
+  const formatNum = (val, dec = 1) =>
+    (val !== undefined && val !== null && !isNaN(Number(val)))
+      ? Number(val).toFixed(dec)
+      : '--';
+
   function renderSignal(d) {
     const card   = document.getElementById('signal-card');
     const isCall = d.direccion === 'CALL';
+    const ind    = d.indicadores || {};
     card.className = 'signal-card ' + (isCall ? 'signal-call' : 'signal-put');
     document.getElementById('sig-direction').textContent =
       isCall ? '🟢 COMPRA (CALL)  ↑' : '🔴 VENTA (PUT)  ↓';
-    document.getElementById('sig-pair').textContent    = d.activo + ' · ' + d.temporalidad;
-    document.getElementById('sig-entrada').textContent = d.entrada;
-    document.getElementById('sig-exp').textContent     = d.expiracion + ' min';
-    document.getElementById('sig-rsi').textContent     = (d.indicadores && d.indicadores.rsi != null)
-      ? d.indicadores.rsi.toFixed(1) : '--';
-    document.getElementById('sig-conf').textContent    = d.confianza.toFixed(1) + '%';
+    document.getElementById('sig-pair').textContent    = (d.activo || '') + ' · ' + (d.temporalidad || '');
+    document.getElementById('sig-entrada').textContent = d.entrada || '--:--:--';
+    document.getElementById('sig-exp').textContent     = (d.expiracion != null ? d.expiracion : '--') + ' min';
+    document.getElementById('sig-rsi').textContent     = formatNum(ind.rsi);
+    document.getElementById('sig-conf').textContent    = formatNum(d.confianza) + '%';
     document.getElementById('sig-conf').className      = 'dc-value ' + (isCall ? 'green' : 'red');
     document.getElementById('sig-motivo').textContent  = '📊 ' + (d.motivo || '');
-    setTimeout(() => { document.getElementById('conf-bar').style.width = d.confianza + '%'; }, 100);
+    const conf = Number(d.confianza) || 0;
+    setTimeout(() => { document.getElementById('conf-bar').style.width = conf + '%'; }, 100);
     card.style.display = 'block';
   }
 
   function renderEsperar(d) {
     const isLateral = d.estado === 'LATERAL';
     const cls       = isLateral ? 'lateral' : 'esperar';
+    const ind       = d.indicadores || {};
 
-    // Header
     document.getElementById('wait-icon').textContent = isLateral ? '⚪' : '🟡';
     const titleEl = document.getElementById('wait-title');
     titleEl.textContent = isLateral ? 'MERCADO LATERAL — ESPERAR' : 'ESPERAR CONFIRMACIÓN';
@@ -1247,25 +1261,19 @@ async def index():
     document.getElementById('wait-header').className = 'wait-header ' + cls;
     document.getElementById('wait-body').className   = 'wait-body '   + cls;
 
-    // Lean (dirección probable)
     const leanEl = document.getElementById('wait-lean');
-    if (d.lean) {
-      leanEl.textContent = 'Sesgo probable: ' + (d.lean === 'CALL' ? '↑ Alcista' : '↓ Bajista');
-    } else {
-      leanEl.textContent = 'Sin sesgo definido aún';
-    }
+    leanEl.textContent = d.lean
+      ? 'Sesgo probable: ' + (d.lean === 'CALL' ? '↑ Alcista' : '↓ Bajista')
+      : 'Sin sesgo definido aún';
 
-    // Indicadores
-    const ind = d.indicadores || {};
-    document.getElementById('wi-rsi').textContent  = ind.rsi  != null ? ind.rsi.toFixed(1)  : '--';
-    document.getElementById('wi-k').textContent    = ind.stoch_k != null ? ind.stoch_k.toFixed(1) : '--';
-    document.getElementById('wi-d').textContent    = ind.stoch_d != null ? ind.stoch_d.toFixed(1) : '--';
+    document.getElementById('wi-rsi').textContent  = formatNum(ind.rsi);
+    document.getElementById('wi-k').textContent    = formatNum(ind.stoch_k);
+    document.getElementById('wi-d').textContent    = formatNum(ind.stoch_d);
     document.getElementById('wi-tend').textContent = ind.tendencia || '—';
 
-    // Condiciones a esperar
     const ul = document.getElementById('wait-conditions');
     ul.innerHTML = '';
-    (d.condiciones || ['Sin datos de condiciones.']).forEach(c => {
+    (d.condiciones || ['Sin datos de condiciones disponibles.']).forEach(c => {
       const li = document.createElement('li');
       if (isLateral) li.className = 'lateral-bullet';
       li.textContent = c;
