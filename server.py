@@ -35,21 +35,23 @@ _bot_proceso = None
 async def lifespan(app: FastAPI):
     """Arranca main.py en segundo plano al iniciar el servidor web."""
     global _bot_proceso
-    try:
-        _bot_proceso = _subprocess.Popen(
-            [_sys.executable, "-u", "main.py"],
-            stdout=None,   # hereda stdout de uvicorn → Railway captura los logs
-            stderr=None,   # hereda stderr de uvicorn → Railway captura los errores
-        )
-        print(f"[LW] Bot de Telegram iniciado (PID {_bot_proceso.pid})", flush=True)
-    except Exception as e:
-        print(f"[LW] No se pudo iniciar main.py: {e}", flush=True)
+    # ── BOT DE TELEGRAM DESACTIVADO TEMPORALMENTE ──
+    # Para reactivar, descomentar el bloque try/except de abajo y la sección yield/terminate.
+    # try:
+    #     _bot_proceso = _subprocess.Popen(
+    #         [_sys.executable, "-u", "main.py"],
+    #         stdout=None,
+    #         stderr=None,
+    #     )
+    #     print(f"[LW] Bot de Telegram iniciado (PID {_bot_proceso.pid})", flush=True)
+    # except Exception as e:
+    #     print(f"[LW] No se pudo iniciar main.py: {e}", flush=True)
+    print("[LW] Bot de Telegram DESACTIVADO — solo modo web.", flush=True)
     _init_auth()
     yield
-    # Al apagar el servidor, terminar el bot también
-    if _bot_proceso and _bot_proceso.poll() is None:
-        _bot_proceso.terminate()
-        print("[LW] Bot de Telegram detenido")
+    # if _bot_proceso and _bot_proceso.poll() is None:
+    #     _bot_proceso.terminate()
+    #     print("[LW] Bot de Telegram detenido")
 
 app = FastAPI(title="L&W PREMIUM IA SIGNS", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
