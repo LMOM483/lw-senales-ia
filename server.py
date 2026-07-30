@@ -12,6 +12,7 @@ import sys as _sys
 import sqlite3 as _sqlite3
 import hashlib as _hashlib
 import secrets as _secrets
+import time as _time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Depends, Header, HTTPException
@@ -72,7 +73,10 @@ class LoginRequest(BaseModel):
 
 # ── Auth: SQLite users + sesión única anti-share ─────────────────────────────
 
-_AUTH_SALT = "lw_senales_ia_2026"   # salt fijo de aplicación
+_AUTH_SALT    = "lw_senales_ia_2026"   # salt fijo de aplicación
+_ADMIN_PW     = _os.environ.get("ADMIN_PASSWORD", "14746952")  # contraseña panel admin
+_admin_sessions: dict = {}   # admin_token → expiry timestamp (float)
+_heartbeats:     dict = {}   # session_token → last_ping epoch (float)
 
 def _hash_pw(password: str) -> str:
     return _hashlib.pbkdf2_hmac(
@@ -112,6 +116,16 @@ def _init_auth():
                 created_at     TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS licenses (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                key           TEXT UNIQUE NOT NULL,
+                status        TEXT DEFAULT 'ACTIVE',
+                created_at    TEXT NOT NULL,
+                expires_at    TEXT NOT NULL,
+                session_token TEXT
+            )
+        """)
         # Usuario administrador (Lina) — se crea si no existe, siempre con is_active=1
         conn.execute("""
             INSERT INTO users (email, password_hash, is_active)
@@ -123,26 +137,37 @@ def _init_auth():
         print("[LW-Auth] Usuario admin listo: linaojeda.reviews@gmail.com")
 
 def _email_from_token(token: str) -> str:
-    """Retorna el email del usuario a partir de su session_token."""
+    """Retorna el email del usuario o la llave VIP a partir de su session_token."""
     try:
         with _db_conn() as conn:
             row = conn.execute(
                 "SELECT email FROM users WHERE session_token = ?", (token,)
             ).fetchone()
-        return row[0] if row else "unknown"
+            if row:
+                return row[0]
+            row = conn.execute(
+                "SELECT key FROM licenses WHERE session_token = ?", (token,)
+            ).fetchone()
+        return row[0] if row else "vip_user"
     except Exception:
         return "unknown"
 
 
 def _verificar_token(x_session_token: str = Header(None)):
-    """Dependency FastAPI: valida token de sesión. Lanza 401 si no es válido."""
+    """Dependency FastAPI: valida token de sesión (users o licenses VIP). Lanza 401 si inválido."""
     if not x_session_token:
         raise HTTPException(status_code=401, detail="No autenticado")
+    ahora_iso = datetime.now(TIMEZONE).isoformat()
     with _db_conn() as conn:
         row = conn.execute(
             "SELECT id FROM users WHERE session_token = ? AND is_active = 1",
             (x_session_token,)
         ).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT id FROM licenses WHERE session_token = ? AND status = 'USED' AND expires_at > ?",
+                (x_session_token, ahora_iso)
+            ).fetchone()
     if not row:
         raise HTTPException(status_code=401, detail="Sesión inválida o abierta en otro dispositivo")
     return x_session_token
@@ -164,8 +189,226 @@ def api_login(req: LoginRequest):
 @app.post("/api/logout")
 def api_logout(token: str = Depends(_verificar_token)):
     with _db_conn() as conn:
-        conn.execute("UPDATE users SET session_token = NULL WHERE session_token = ?", (token,))
+        conn.execute("UPDATE users    SET session_token = NULL WHERE session_token = ?", (token,))
+        conn.execute("UPDATE licenses SET session_token = NULL WHERE session_token = ?", (token,))
+    if token in _heartbeats:
+        del _heartbeats[token]
     return JSONResponse({"ok": True})
+
+# ── L&W KEY SYSTEM — Modelos, helpers y endpoints ───────────────────────────
+
+class ActivateKeyRequest(BaseModel):
+    key: str
+
+class AdminLoginRequest(BaseModel):
+    password: str
+
+
+def _generate_vip_key() -> str:
+    """Genera una llave VIP única tipo LW-VIP-XXXXXXXX."""
+    import random, string
+    chars = string.ascii_uppercase + string.digits
+    seg = ''.join(random.choices(chars, k=8))
+    candidate = f"LW-VIP-{seg}"
+    with _db_conn() as conn:
+        row = conn.execute("SELECT id FROM licenses WHERE key = ?", (candidate,)).fetchone()
+    return _generate_vip_key() if row else candidate
+
+
+def _verify_admin(x_admin_token: str = Header(None)):
+    """Dependency: valida token de sesión de administración."""
+    if not x_admin_token or x_admin_token not in _admin_sessions:
+        raise HTTPException(status_code=403, detail="Acceso denegado al panel de administración")
+    if _time.time() > _admin_sessions.get(x_admin_token, 0):
+        _admin_sessions.pop(x_admin_token, None)
+        raise HTTPException(status_code=403, detail="Sesión de administración expirada")
+    return x_admin_token
+
+
+@app.post("/api/activate-key")
+def api_activate_key(req: ActivateKeyRequest):
+    """Valida y activa una Llave VIP. Devuelve session_token si es válida."""
+    key    = req.key.strip().upper()
+    ahora  = datetime.now(TIMEZONE)
+    with _db_conn() as conn:
+        row = conn.execute(
+            "SELECT id, status, expires_at, session_token FROM licenses WHERE key = ?", (key,)
+        ).fetchone()
+    if not row:
+        return JSONResponse(
+            {"ok": False, "error": "Llave no válida. Verifica que la escribiste correctamente."},
+            status_code=401,
+        )
+    lic_id, status, expires_at_str, old_token = row
+    if status == "EXPIRED":
+        return JSONResponse(
+            {"ok": False, "error": "Esta llave ha expirado. Contáctanos para renovar tu acceso."},
+            status_code=401,
+        )
+    try:
+        expires_dt = datetime.fromisoformat(expires_at_str)
+        if ahora > expires_dt:
+            with _db_conn() as conn:
+                conn.execute("UPDATE licenses SET status = 'EXPIRED' WHERE id = ?", (lic_id,))
+            return JSONResponse(
+                {"ok": False, "error": "Tu acceso ha expirado. Contáctanos para renovar."},
+                status_code=401,
+            )
+    except Exception:
+        pass
+    # Limpiar heartbeat de la sesión anterior (control de sesión única)
+    if old_token and old_token in _heartbeats:
+        del _heartbeats[old_token]
+    # Generar nuevo token e invalidar sesión anterior automáticamente
+    token = _secrets.token_urlsafe(32)
+    with _db_conn() as conn:
+        conn.execute(
+            "UPDATE licenses SET status = 'USED', session_token = ? WHERE id = ?",
+            (token, lic_id),
+        )
+    return JSONResponse({"ok": True, "token": token, "expires_at": expires_at_str})
+
+
+@app.post("/api/heartbeat")
+def api_heartbeat(x_session_token: str = Header(None)):
+    """Ping de sesión activa — permite contar usuarios en línea en el panel admin."""
+    if x_session_token:
+        ahora_iso = datetime.now(TIMEZONE).isoformat()
+        with _db_conn() as conn:
+            u = conn.execute(
+                "SELECT id FROM users WHERE session_token = ? AND is_active = 1",
+                (x_session_token,)
+            ).fetchone()
+            if not u:
+                u = conn.execute(
+                    "SELECT id FROM licenses WHERE session_token = ? AND status = 'USED' AND expires_at > ?",
+                    (x_session_token, ahora_iso)
+                ).fetchone()
+        if u:
+            _heartbeats[x_session_token] = _time.time()
+    return JSONResponse({"ok": True})
+
+
+@app.post("/admin/api/login")
+def admin_login_endpoint(req: AdminLoginRequest):
+    """Autenticación del panel de administración."""
+    if req.password != _ADMIN_PW:
+        return JSONResponse({"ok": False, "error": "Contraseña incorrecta."}, status_code=403)
+    token = _secrets.token_urlsafe(24)
+    _admin_sessions[token] = _time.time() + 8 * 3600   # sesión de 8 horas
+    return JSONResponse({"ok": True, "token": token})
+
+
+@app.post("/admin/api/generate-key")
+def admin_generate_key(_tok: str = Depends(_verify_admin)):
+    """Genera una nueva Llave VIP de 30 días."""
+    ahora    = datetime.now(TIMEZONE)
+    nueva_key = _generate_vip_key()
+    expires  = (ahora + timedelta(days=30)).isoformat()
+    with _db_conn() as conn:
+        conn.execute(
+            "INSERT INTO licenses (key, status, created_at, expires_at) VALUES (?, 'ACTIVE', ?, ?)",
+            (nueva_key, ahora.isoformat(), expires),
+        )
+    return JSONResponse({"ok": True, "key": nueva_key, "expires_at": expires})
+
+
+@app.get("/admin/api/licenses")
+def admin_list_licenses(_tok: str = Depends(_verify_admin)):
+    """Retorna todas las licencias con estado efectivo."""
+    ahora_iso = datetime.now(TIMEZONE).isoformat()
+    with _db_conn() as conn:
+        rows = conn.execute(
+            "SELECT key, status, created_at, expires_at, session_token FROM licenses ORDER BY id DESC"
+        ).fetchall()
+    result = []
+    for r in rows:
+        key, status, created_at, expires_at, session_token = r
+        effective = status
+        if status != "EXPIRED" and expires_at and expires_at < ahora_iso:
+            effective = "EXPIRED"
+        is_online = (
+            session_token is not None
+            and session_token in _heartbeats
+            and (_time.time() - _heartbeats[session_token]) < 90
+        )
+        result.append({
+            "key":        key,
+            "status":     effective,
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "is_online":  is_online,
+        })
+    return JSONResponse({"ok": True, "licenses": result})
+
+
+@app.post("/admin/api/revoke-key/{key}")
+def admin_revoke_key(key: str, _tok: str = Depends(_verify_admin)):
+    """Revoca una llave (la marca como EXPIRED y cierra su sesión activa)."""
+    with _db_conn() as conn:
+        row = conn.execute("SELECT id, session_token FROM licenses WHERE key = ?", (key,)).fetchone()
+        if not row:
+            return JSONResponse({"ok": False, "error": "Llave no encontrada."}, status_code=404)
+        lic_id, session_token = row
+        conn.execute(
+            "UPDATE licenses SET status = 'EXPIRED', session_token = NULL WHERE id = ?", (lic_id,)
+        )
+    if session_token and session_token in _heartbeats:
+        del _heartbeats[session_token]
+    return JSONResponse({"ok": True})
+
+
+@app.post("/admin/api/extend-key/{key}")
+def admin_extend_key(key: str, _tok: str = Depends(_verify_admin)):
+    """Extiende el acceso de una llave en 30 días adicionales."""
+    ahora = datetime.now(TIMEZONE)
+    with _db_conn() as conn:
+        row = conn.execute(
+            "SELECT id, expires_at FROM licenses WHERE key = ?", (key,)
+        ).fetchone()
+        if not row:
+            return JSONResponse({"ok": False, "error": "Llave no encontrada."}, status_code=404)
+        lic_id, expires_at_str = row
+        try:
+            old_exp = datetime.fromisoformat(expires_at_str)
+            base    = max(old_exp, ahora)
+        except Exception:
+            base = ahora
+        new_exp = (base + timedelta(days=30)).isoformat()
+        conn.execute(
+            "UPDATE licenses SET expires_at = ?, status = 'ACTIVE' WHERE id = ?",
+            (new_exp, lic_id),
+        )
+    return JSONResponse({"ok": True, "new_expires_at": new_exp})
+
+
+@app.get("/admin/api/stats")
+def admin_stats(_tok: str = Depends(_verify_admin)):
+    """Estadísticas en tiempo real: usuarios en línea y conteos de licencias."""
+    ahora = _time.time()
+    # Limpiar heartbeats viejos (> 120 s)
+    old_keys = [k for k, ts in list(_heartbeats.items()) if ahora - ts > 120]
+    for k in old_keys:
+        _heartbeats.pop(k, None)
+    online = sum(1 for ts in _heartbeats.values() if ahora - ts < 90)
+    with _db_conn() as conn:
+        row = conn.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'ACTIVE'  THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'USED'    THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'EXPIRED' THEN 1 ELSE 0 END)
+            FROM licenses
+        """).fetchone()
+    total, active, used, expired = row if row else (0, 0, 0, 0)
+    return JSONResponse({
+        "online_now":      online,
+        "total_licenses":  total   or 0,
+        "active":          active  or 0,
+        "used":            used    or 0,
+        "expired":         expired or 0,
+    })
+
 
 # ── Sesiones oficiales L&W ───────────────────────────────────────────────────
 _SESIONES_LW = [
@@ -740,6 +983,346 @@ def top_assets(intervalo: str = "5min", otc: bool = False, _tok: str = Depends(_
 
 
 # ── Frontend ─────────────────────────────────────────────────────────────────
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    return r"""<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>L&W Admin · Panel de Control</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;500;600&display=swap');
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{--cyan:#00f2fe;--purple:#a855f7;--green:#22c55e;--red:#ef4444;--gold:#f59e0b;--bg:#080b18;--card:rgba(10,14,30,.98);--surface:rgba(24,29,51,.9);--border:rgba(168,85,247,.3);--muted:rgba(148,163,184,.65)}
+    body{background:var(--bg);color:#fff;font-family:'Inter',sans-serif;min-height:100vh;padding:24px 16px;background-image:radial-gradient(ellipse 70% 50% at 15% 5%,rgba(168,85,247,.1) 0%,transparent 55%),radial-gradient(ellipse 60% 50% at 85% 95%,rgba(0,242,254,.08) 0%,transparent 55%)}
+    .page-wrap{max-width:960px;margin:0 auto}
+    h1{font-family:'Orbitron',sans-serif;font-size:20px;font-weight:900;background:linear-gradient(90deg,var(--purple),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;letter-spacing:2px;margin-bottom:4px}
+    .subtitle{font-size:11px;color:var(--muted);letter-spacing:1.2px;text-transform:uppercase}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:24px;margin-bottom:20px}
+    /* ── Login ── */
+    #login-section{max-width:380px;margin:80px auto}
+    #login-section .lock-icon{font-size:36px;text-align:center;margin-bottom:12px}
+    #login-section h2{font-family:'Orbitron',sans-serif;font-size:13px;color:var(--purple);margin-bottom:6px;text-align:center;letter-spacing:1px}
+    #login-section p{font-size:11px;color:var(--muted);text-align:center;margin-bottom:22px}
+    input[type=password]{width:100%;padding:13px 16px;background:var(--surface);border:1px solid rgba(59,130,246,.45);border-radius:11px;color:#fff;font-size:15px;outline:none;margin-bottom:14px;transition:border-color .2s}
+    input[type=password]:focus{border-color:var(--cyan);box-shadow:0 0 12px rgba(0,242,254,.2)}
+    /* ── Buttons ── */
+    .btn{padding:13px 20px;border:none;border-radius:11px;font-family:'Orbitron',sans-serif;font-size:12px;font-weight:700;letter-spacing:1.2px;color:#fff;cursor:pointer;transition:opacity .15s,transform .1s;display:inline-block}
+    .btn-primary{background:linear-gradient(135deg,var(--purple),var(--cyan));width:100%}
+    .btn-primary:hover{opacity:.85}
+    .btn-gold{background:linear-gradient(135deg,#b45309,var(--gold));padding:14px 28px}
+    .btn-gold:hover{opacity:.85;transform:scale(1.02)}
+    .btn-sm{padding:6px 14px;border-radius:8px;font-family:'Inter',sans-serif;font-size:11px;font-weight:700;letter-spacing:.3px;cursor:pointer;border:none;color:#fff;transition:opacity .15s}
+    .btn-icon{background:rgba(0,242,254,.1);border:1px solid rgba(0,242,254,.25);color:var(--cyan);font-family:'Inter',sans-serif}
+    .btn-icon:hover{background:rgba(0,242,254,.2)}
+    .btn-danger{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.3);color:#f87171}
+    .btn-danger:hover{background:rgba(239,68,68,.25)}
+    .btn-extend{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.28);color:#4ade80}
+    .btn-extend:hover{background:rgba(34,197,94,.22)}
+    .btn-logout{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);color:#f87171;padding:7px 16px}
+    /* ── Stats grid ── */
+    .stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:22px}
+    .stat-box{background:var(--card);border:1px solid var(--border);border-radius:13px;padding:18px 12px;text-align:center}
+    .stat-val{font-family:'Orbitron',sans-serif;font-size:32px;font-weight:900;line-height:1;margin-bottom:6px}
+    .stat-val.green{color:var(--green);text-shadow:0 0 18px var(--green)}
+    .stat-val.purple{color:var(--purple)}
+    .stat-val.cyan{color:var(--cyan)}
+    .stat-val.red{color:var(--red)}
+    .stat-lbl{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+    /* ── New key box ── */
+    .new-key-box{margin-top:18px;padding:20px;background:rgba(0,242,254,.05);border:1.5px solid var(--cyan);border-radius:13px;display:none;text-align:center}
+    .new-key-text{font-family:'Orbitron',sans-serif;font-size:22px;color:var(--cyan);letter-spacing:3px;margin-bottom:12px;word-break:break-all}
+    .btn-copy{background:rgba(0,242,254,.1);border:1px solid var(--cyan);color:var(--cyan);padding:8px 20px;border-radius:9px;font-size:12px;cursor:pointer;font-family:'Inter',sans-serif;font-weight:600}
+    .btn-copy:hover{background:rgba(0,242,254,.2)}
+    .copy-note{font-size:10px;color:var(--muted);margin-top:10px}
+    /* ── Table ── */
+    .tbl-wrap{overflow-x:auto}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th{text-align:left;padding:10px 14px;font-size:9px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:var(--purple);border-bottom:1px solid rgba(168,85,247,.22)}
+    td{padding:11px 14px;border-bottom:1px solid rgba(255,255,255,.04);color:#e2e8f0;vertical-align:middle}
+    tr:last-child td{border-bottom:none}
+    tr:hover td{background:rgba(168,85,247,.04)}
+    .badge{display:inline-block;padding:3px 10px;border-radius:99px;font-size:10px;font-weight:700;letter-spacing:.8px}
+    .badge-active{background:rgba(34,197,94,.12);color:#4ade80;border:1px solid rgba(34,197,94,.28)}
+    .badge-used{background:rgba(0,242,254,.1);color:var(--cyan);border:1px solid rgba(0,242,254,.22)}
+    .badge-expired{background:rgba(239,68,68,.1);color:#f87171;border:1px solid rgba(239,68,68,.25)}
+    .online-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 7px var(--green);margin-right:5px;vertical-align:middle}
+    .offline-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:rgba(148,163,184,.25);margin-right:5px;vertical-align:middle}
+    .key-mono{font-family:'Orbitron',sans-serif;font-size:12px;color:var(--gold);letter-spacing:1.5px}
+    .td-actions{display:flex;gap:7px;flex-wrap:wrap}
+    /* ── Misc ── */
+    .section-title{font-family:'Orbitron',sans-serif;font-size:12px;color:var(--purple);font-weight:700;letter-spacing:1px;margin-bottom:16px}
+    .err-msg{padding:11px 14px;background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.28);border-radius:9px;font-size:12px;color:#f87171;margin-top:12px;display:none}
+    .refresh-note{font-size:10px;color:rgba(148,163,184,.4);text-align:right;margin-bottom:6px}
+    @media(max-width:640px){.stats-grid{grid-template-columns:1fr 1fr}.key-mono{font-size:10px;letter-spacing:.8px}}
+  </style>
+</head>
+<body>
+
+<!-- ════ LOGIN ════ -->
+<div id="login-section" class="card">
+  <div class="lock-icon">🔐</div>
+  <h2>ACCESO ADMINISTRADOR</h2>
+  <p>Panel exclusivo para Lina · L&W Key System</p>
+  <input type="password" id="admin-pw" placeholder="Contraseña de administración"
+         onkeydown="if(event.key==='Enter') adminLogin()">
+  <button class="btn btn-primary" onclick="adminLogin()">INGRESAR AL PANEL</button>
+  <div class="err-msg" id="admin-err"></div>
+</div>
+
+<!-- ════ DASHBOARD ════ -->
+<div id="dashboard-section" style="display:none">
+  <div class="page-wrap">
+
+    <!-- Header -->
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;">
+      <div>
+        <h1>L&W KEY SYSTEM</h1>
+        <div class="subtitle">Panel de Administración · Lina Ojeda</div>
+      </div>
+      <button class="btn btn-sm btn-logout" onclick="adminLogout()">🚪 Salir</button>
+    </div>
+
+    <!-- Stats -->
+    <div class="stats-grid">
+      <div class="stat-box">
+        <div class="stat-val green" id="st-online">—</div>
+        <div class="stat-lbl">🟢 En línea ahora</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-val purple" id="st-total">—</div>
+        <div class="stat-lbl">Total llaves</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-val cyan" id="st-used">—</div>
+        <div class="stat-lbl">Activas / En uso</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-val red" id="st-expired">—</div>
+        <div class="stat-lbl">Expiradas</div>
+      </div>
+    </div>
+
+    <!-- Generate key -->
+    <div class="card">
+      <div class="section-title">⚡ GENERAR LLAVE VIP</div>
+      <button class="btn btn-gold" id="btn-gen" onclick="generateKey()">
+        + Generar Llave VIP (30 Días)
+      </button>
+      <div class="new-key-box" id="new-key-box">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:1px;">
+          ✅ Nueva Llave Generada — Lista para copiar
+        </div>
+        <div class="new-key-text" id="new-key-text">—</div>
+        <button class="btn-copy" id="btn-copy" onclick="copyKey()">📋 Copiar Llave</button>
+        <div class="copy-note">Válida 30 días · Un solo dispositivo simultáneo</div>
+      </div>
+    </div>
+
+    <!-- Licenses table -->
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+        <div class="section-title" style="margin:0">📋 TODAS LAS LLAVES</div>
+        <button class="btn btn-sm btn-icon" onclick="loadDashboard()">↻ Refrescar</button>
+      </div>
+      <div class="refresh-note" id="last-refresh"></div>
+      <div class="tbl-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Llave VIP</th>
+              <th>Estado</th>
+              <th>Creada</th>
+              <th>Expira</th>
+              <th>Sesión</th>
+              <th>Acciones</th>
+            </tr>
+          </thead>
+          <tbody id="licenses-tbody">
+            <tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px;">Cargando...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </div><!-- /page-wrap -->
+</div><!-- /dashboard-section -->
+
+<script>
+  let _adminToken = localStorage.getItem('lw_admin_token') || '';
+  let _refreshInterval = null;
+
+  async function adminLogin() {
+    const pw  = (document.getElementById('admin-pw').value || '').trim();
+    const err = document.getElementById('admin-err');
+    err.style.display = 'none';
+    if (!pw) { err.textContent = 'Ingresa la contraseña.'; err.style.display = 'block'; return; }
+    try {
+      const resp = await fetch('/admin/api/login', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({password: pw}),
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        _adminToken = data.token;
+        localStorage.setItem('lw_admin_token', _adminToken);
+        showDashboard();
+      } else {
+        err.textContent = data.error || 'Contraseña incorrecta.';
+        err.style.display = 'block';
+      }
+    } catch (e) {
+      err.textContent = 'Error de conexión. Intenta de nuevo.';
+      err.style.display = 'block';
+    }
+  }
+
+  function adminLogout() {
+    localStorage.removeItem('lw_admin_token');
+    _adminToken = '';
+    if (_refreshInterval) clearInterval(_refreshInterval);
+    document.getElementById('login-section').style.display = '';
+    document.getElementById('dashboard-section').style.display = 'none';
+  }
+
+  function adminHeaders() {
+    return {'Content-Type': 'application/json', 'X-Admin-Token': _adminToken};
+  }
+
+  function showDashboard() {
+    document.getElementById('login-section').style.display = 'none';
+    document.getElementById('dashboard-section').style.display = 'block';
+    loadDashboard();
+    if (_refreshInterval) clearInterval(_refreshInterval);
+    _refreshInterval = setInterval(loadDashboard, 15000);
+  }
+
+  async function loadDashboard() {
+    await Promise.all([loadStats(), loadLicenses()]);
+    const now = new Date().toLocaleTimeString('es-ES', {hour12: false});
+    document.getElementById('last-refresh').textContent = 'Actualizado: ' + now;
+  }
+
+  async function loadStats() {
+    try {
+      const resp = await fetch('/admin/api/stats', {headers: adminHeaders()});
+      if (resp.status === 403) { adminLogout(); return; }
+      const d = await resp.json();
+      document.getElementById('st-online').textContent  = d.online_now      ?? '—';
+      document.getElementById('st-total').textContent   = d.total_licenses  ?? '—';
+      document.getElementById('st-used').textContent    = (d.used ?? 0) + (d.active ?? 0);
+      document.getElementById('st-expired').textContent = d.expired         ?? '—';
+    } catch (e) {}
+  }
+
+  async function loadLicenses() {
+    try {
+      const resp = await fetch('/admin/api/licenses', {headers: adminHeaders()});
+      if (resp.status === 403) { adminLogout(); return; }
+      const data = await resp.json();
+      renderLicenses(data.licenses || []);
+    } catch (e) {}
+  }
+
+  function renderLicenses(licenses) {
+    const tbody = document.getElementById('licenses-tbody');
+    if (!licenses.length) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px;">Sin llaves generadas aún. Crea tu primera llave arriba.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = licenses.map(l => {
+      const statusBadge =
+        l.status === 'ACTIVE'  ? '<span class="badge badge-active">🟢 ACTIVA</span>'  :
+        l.status === 'USED'    ? '<span class="badge badge-used">🔵 EN USO</span>'    :
+                                  '<span class="badge badge-expired">🔴 EXPIRADA</span>';
+      const sessionDot = l.is_online
+        ? '<span class="online-dot"></span><span style="font-size:11px;color:#4ade80">En línea</span>'
+        : '<span class="offline-dot"></span><span style="font-size:11px;color:var(--muted)">Fuera</span>';
+      const created = (l.created_at || '').slice(0, 10);
+      const expires = (l.expires_at || '').slice(0, 10);
+      const k = (l.key || '').replace(/'/g, '');
+      return '<tr>'
+        + '<td><span class="key-mono">' + (l.key || '—') + '</span></td>'
+        + '<td>' + statusBadge + '</td>'
+        + '<td style="font-size:12px;color:var(--muted)">' + created + '</td>'
+        + '<td style="font-size:12px">' + expires + '</td>'
+        + '<td>' + sessionDot + '</td>'
+        + '<td><div class="td-actions">'
+        +   '<button class="btn btn-sm btn-extend" onclick="extendKey(\'' + k + '\')">+30 días</button>'
+        +   '<button class="btn btn-sm btn-danger" onclick="revokeKey(\'' + k + '\')">Revocar</button>'
+        + '</div></td>'
+        + '</tr>';
+    }).join('');
+  }
+
+  async function generateKey() {
+    const btn = document.getElementById('btn-gen');
+    const box = document.getElementById('new-key-box');
+    const txt = document.getElementById('new-key-text');
+    box.style.display = 'none';
+    btn.disabled = true; btn.textContent = 'Generando...';
+    try {
+      const resp = await fetch('/admin/api/generate-key', {method: 'POST', headers: adminHeaders()});
+      if (resp.status === 403) { adminLogout(); return; }
+      const data = await resp.json();
+      if (data.ok) {
+        txt.textContent = data.key;
+        box.style.display = 'block';
+        document.getElementById('btn-copy').textContent = '📋 Copiar Llave';
+        await loadLicenses();
+        await loadStats();
+      } else {
+        alert('Error al generar llave: ' + (data.error || ''));
+      }
+    } catch (e) {
+      alert('Error de conexión al generar llave.');
+    } finally {
+      btn.disabled = false; btn.textContent = '+ Generar Llave VIP (30 Días)';
+    }
+  }
+
+  function copyKey() {
+    const key = document.getElementById('new-key-text').textContent;
+    if (!key || key === '—') return;
+    navigator.clipboard.writeText(key).then(() => {
+      const btn = document.getElementById('btn-copy');
+      if (btn) { btn.textContent = '✅ Copiada!'; setTimeout(() => { btn.textContent = '📋 Copiar Llave'; }, 2500); }
+    }).catch(() => {
+      prompt('Copia esta llave:', key);
+    });
+  }
+
+  async function revokeKey(key) {
+    if (!confirm('¿Revocar la llave ' + key + '?\nEl usuario perderá acceso de inmediato.')) return;
+    try {
+      const resp = await fetch('/admin/api/revoke-key/' + encodeURIComponent(key), {method: 'POST', headers: adminHeaders()});
+      if (resp.status === 403) { adminLogout(); return; }
+      await loadLicenses();
+      await loadStats();
+    } catch (e) { alert('Error al revocar la llave.'); }
+  }
+
+  async function extendKey(key) {
+    if (!confirm('¿Extender 30 días adicionales la llave ' + key + '?')) return;
+    try {
+      const resp = await fetch('/admin/api/extend-key/' + encodeURIComponent(key), {method: 'POST', headers: adminHeaders()});
+      if (resp.status === 403) { adminLogout(); return; }
+      const data = await resp.json();
+      if (data.ok) { await loadLicenses(); }
+    } catch (e) { alert('Error al extender la llave.'); }
+  }
+
+  // Auto-login si hay token guardado en localStorage
+  (function init() {
+    if (_adminToken) showDashboard();
+  })();
+</script>
+</body>
+</html>"""
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -1349,28 +1932,79 @@ async def index():
 
     <!-- ══ LOGIN ══ -->
     <div id="screen-login" class="tab-pane active">
-      <div style="text-align:center;margin-bottom:22px;">
+      <div style="text-align:center;margin-bottom:18px;">
         <div style="font-family:'Orbitron',sans-serif;font-size:15px;font-weight:900;
              background:linear-gradient(135deg,var(--purple),var(--cyan));
              -webkit-background-clip:text;-webkit-text-fill-color:transparent;
              background-clip:text;letter-spacing:1px;">L&W PREMIUM IA SIGNS</div>
         <div style="font-size:11px;color:var(--muted);margin-top:4px;">Acceso exclusivo para miembros</div>
       </div>
-      <div class="form-group">
-        <label>Email</label>
-        <input type="email" id="login-email" placeholder="tu@email.com"
-               onkeydown="if(event.key==='Enter') doLogin()">
+
+      <!-- Selector de modo de acceso -->
+      <div style="display:flex;border-radius:11px;overflow:hidden;border:1px solid rgba(168,85,247,.3);margin-bottom:20px;">
+        <button id="btn-mode-key" onclick="setLoginMode('key')"
+          style="flex:1;padding:11px 6px;border:none;font-size:11px;font-weight:700;cursor:pointer;
+                 background:rgba(168,85,247,.22);color:var(--purple);letter-spacing:.6px;
+                 transition:background .15s,color .15s;">
+          🔑 LLAVE VIP</button>
+        <button id="btn-mode-email" onclick="setLoginMode('email')"
+          style="flex:1;padding:11px 6px;border:none;font-size:11px;font-weight:600;cursor:pointer;
+                 background:transparent;color:var(--muted);letter-spacing:.6px;
+                 transition:background .15s,color .15s;">
+          📧 Admin</button>
       </div>
-      <div class="form-group">
-        <label>Contraseña</label>
-        <input type="password" id="login-password" placeholder="••••••••"
-               onkeydown="if(event.key==='Enter') doLogin()">
+
+      <!-- ══ Modo: Llave VIP (default) ══ -->
+      <div id="login-key-mode">
+        <div style="text-align:center;margin-bottom:18px;padding:16px 14px;
+             background:linear-gradient(135deg,rgba(245,158,11,.07),rgba(168,85,247,.07));
+             border:1px solid rgba(245,158,11,.22);border-radius:14px;">
+          <div style="font-size:26px;margin-bottom:6px;">🔑</div>
+          <div style="font-family:'Orbitron',sans-serif;font-size:12px;font-weight:700;
+               color:var(--gold);letter-spacing:1px;">LLAVE VIP L&W</div>
+          <div style="font-size:11px;color:var(--muted);margin-top:5px;line-height:1.5;">
+            Ingresa tu llave para activar 30 días de acceso completo
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Tu Llave VIP</label>
+          <input type="text" id="vip-key-input" placeholder="LW-VIP-XXXXXXXX"
+                 style="text-transform:uppercase;letter-spacing:2px;text-align:center;
+                        font-family:'Orbitron',sans-serif;font-size:16px;"
+                 onkeydown="if(event.key==='Enter') doActivateKey()">
+        </div>
+        <div id="key-error"
+             style="display:none;color:#f87171;font-size:12px;margin-bottom:12px;
+                    padding:10px 12px;background:rgba(239,68,68,.07);
+                    border:1px solid rgba(239,68,68,.25);border-radius:8px;"></div>
+        <button class="btn btn-gold" id="btn-activate-key" onclick="doActivateKey()"
+                style="width:100%;padding:14px;">
+          ⚡ ACTIVAR LLAVE
+        </button>
+        <div style="font-size:10px;color:rgba(148,163,184,.4);text-align:center;margin-top:14px;line-height:1.7;">
+          ¿No tienes llave VIP? Adquiere tu membresía<br>
+          contactándonos por Telegram o WhatsApp.
+        </div>
       </div>
-      <div id="login-error"
-           style="display:none;color:#f87171;font-size:12px;margin-bottom:12px;
-                  padding:10px 12px;background:rgba(239,68,68,.07);
-                  border:1px solid rgba(239,68,68,.25);border-radius:8px;"></div>
-      <button class="btn btn-primary" id="btn-login" onclick="doLogin()">Ingresar</button>
+
+      <!-- ══ Modo: Email / Admin (oculto por defecto) ══ -->
+      <div id="login-email-mode" style="display:none;">
+        <div class="form-group">
+          <label>Email</label>
+          <input type="email" id="login-email" placeholder="tu@email.com"
+                 onkeydown="if(event.key==='Enter') doLogin()">
+        </div>
+        <div class="form-group">
+          <label>Contraseña</label>
+          <input type="password" id="login-password" placeholder="••••••••"
+                 onkeydown="if(event.key==='Enter') doLogin()">
+        </div>
+        <div id="login-error"
+             style="display:none;color:#f87171;font-size:12px;margin-bottom:12px;
+                    padding:10px 12px;background:rgba(239,68,68,.07);
+                    border:1px solid rgba(239,68,68,.25);border-radius:8px;"></div>
+        <button class="btn btn-primary" id="btn-login" onclick="doLogin()">Ingresar</button>
+      </div>
     </div>
 
     <!-- ══ TAB 1: BOT IA ══ -->
@@ -1866,6 +2500,7 @@ async def index():
   }
 
   async function doLogout() {
+    stopHeartbeat();
     try {
       await fetch('/api/logout', { method: 'POST', headers: apiHeaders() });
     } catch (_) {}
@@ -1880,6 +2515,7 @@ async def index():
     document.getElementById('bottom-nav').classList.add('visible');
     switchTab('bot');
     startScannerHome();
+    startHeartbeat();
   }
 
   function showLogin(msg) {
@@ -2395,6 +3031,73 @@ async def index():
   /* ── Academia acordeón ── */
   function toggleTutorial(card) {
     card.classList.toggle('open');
+  }
+
+  /* ══ L&W KEY SYSTEM ══ */
+
+  /* ── Selector de modo login (Llave VIP / Admin email) ── */
+  function setLoginMode(mode) {
+    const isKey = mode === 'key';
+    document.getElementById('login-key-mode').style.display   = isKey ? '' : 'none';
+    document.getElementById('login-email-mode').style.display = isKey ? 'none' : '';
+    const btnKey   = document.getElementById('btn-mode-key');
+    const btnEmail = document.getElementById('btn-mode-email');
+    if (btnKey) {
+      btnKey.style.background = isKey ? 'rgba(168,85,247,.22)' : 'transparent';
+      btnKey.style.color      = isKey ? 'var(--purple)' : 'var(--muted)';
+    }
+    if (btnEmail) {
+      btnEmail.style.background = isKey ? 'transparent' : 'rgba(168,85,247,.22)';
+      btnEmail.style.color      = isKey ? 'var(--muted)' : 'var(--purple)';
+    }
+  }
+
+  /* ── Activación de Llave VIP ── */
+  async function doActivateKey() {
+    const keyEl = document.getElementById('vip-key-input');
+    const errEl = document.getElementById('key-error');
+    const btnEl = document.getElementById('btn-activate-key');
+    const key   = (keyEl ? keyEl.value : '').trim().toUpperCase();
+    if (errEl) errEl.style.display = 'none';
+    if (!key) {
+      if (errEl) { errEl.textContent = 'Ingresa tu Llave VIP.'; errEl.style.display = 'block'; }
+      return;
+    }
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = 'Verificando...'; }
+    try {
+      const resp = await fetch('/api/activate-key', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key }),
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        saveToken(data.token);
+        enterApp();
+      } else {
+        if (errEl) { errEl.textContent = data.error || 'Llave inválida o expirada.'; errEl.style.display = 'block'; }
+      }
+    } catch (e) {
+      if (errEl) { errEl.textContent = 'Error de conexión. Intenta de nuevo.'; errEl.style.display = 'block'; }
+    } finally {
+      if (btnEl) { btnEl.disabled = false; btnEl.textContent = '⚡ ACTIVAR LLAVE'; }
+    }
+  }
+
+  /* ── Heartbeat (keep-alive para conteo de usuarios en línea) ── */
+  let _heartbeatInterval = null;
+
+  function startHeartbeat() {
+    if (_heartbeatInterval) clearInterval(_heartbeatInterval);
+    // Ping inicial inmediato
+    fetch('/api/heartbeat', { method: 'POST', headers: apiHeaders() }).catch(() => {});
+    _heartbeatInterval = setInterval(() => {
+      fetch('/api/heartbeat', { method: 'POST', headers: apiHeaders() }).catch(() => {});
+    }, 30000);
+  }
+
+  function stopHeartbeat() {
+    if (_heartbeatInterval) { clearInterval(_heartbeatInterval); _heartbeatInterval = null; }
   }
 </script>
 
