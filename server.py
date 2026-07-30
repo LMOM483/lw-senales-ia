@@ -3,6 +3,7 @@ server.py - Interfaz web L&W PREMIUM IA SIGNS
 FastAPI: sirve el frontend y expone /api/analizar para ejecutar analizar_activo en tiempo real.
 """
 
+import asyncio as _asyncio
 import requests as _requests
 import pandas as pd
 import ta as _ta
@@ -48,7 +49,9 @@ async def lifespan(app: FastAPI):
     #     print(f"[LW] No se pudo iniciar main.py: {e}", flush=True)
     print("[LW] Bot de Telegram DESACTIVADO — solo modo web.", flush=True)
     _init_auth()
+    task = _asyncio.create_task(_verificar_señales_loop())
     yield
+    task.cancel()
     # if _bot_proceso and _bot_proceso.poll() is None:
     #     _bot_proceso.terminate()
     #     print("[LW] Bot de Telegram detenido")
@@ -80,7 +83,7 @@ def _db_conn():
     return _sqlite3.connect(Config.DATABASE_FILE, check_same_thread=False)
 
 def _init_auth():
-    """Crea tabla users e inserta/actualiza usuarios al arrancar."""
+    """Crea tablas de auth y web_signals e inserta/actualiza admin al arrancar."""
     with _db_conn() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -89,6 +92,24 @@ def _init_auth():
                 password_hash TEXT NOT NULL,
                 is_active     INTEGER DEFAULT 1,
                 session_token TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS web_signals (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_email     TEXT NOT NULL,
+                symbol         TEXT NOT NULL,
+                direction      TEXT NOT NULL,
+                entry_price    REAL NOT NULL,
+                entry_time     TEXT NOT NULL,
+                entry_dt       TEXT NOT NULL,
+                expiration_min INTEGER NOT NULL,
+                otc            INTEGER DEFAULT 0,
+                sesion_key     TEXT,
+                resultado      TEXT,
+                close_price    REAL,
+                verified_at    TEXT,
+                created_at     TEXT NOT NULL
             )
         """)
         # Usuario administrador (Lina) — se crea si no existe, siempre con is_active=1
@@ -100,6 +121,18 @@ def _init_auth():
                 is_active     = 1
         """, ("linaojeda.reviews@gmail.com", _hash_pw("14746952")))
         print("[LW-Auth] Usuario admin listo: linaojeda.reviews@gmail.com")
+
+def _email_from_token(token: str) -> str:
+    """Retorna el email del usuario a partir de su session_token."""
+    try:
+        with _db_conn() as conn:
+            row = conn.execute(
+                "SELECT email FROM users WHERE session_token = ?", (token,)
+            ).fetchone()
+        return row[0] if row else "unknown"
+    except Exception:
+        return "unknown"
+
 
 def _verificar_token(x_session_token: str = Header(None)):
     """Dependency FastAPI: valida token de sesión. Lanza 401 si no es válido."""
@@ -397,6 +430,26 @@ def analizar_mercado(req: AnalisisRequest, _tok: str = Depends(_verificar_token)
             mins = (5 - (ahora.minute % 5)) % 5 or 5
             entrada = ahora + timedelta(minutes=mins)
 
+        # Guardar señal en BD para verificación posterior
+        try:
+            sesion_act = _get_sesion_actual()
+            with _db_conn() as conn:
+                conn.execute("""
+                    INSERT INTO web_signals
+                    (user_email,symbol,direction,entry_price,entry_time,entry_dt,
+                     expiration_min,otc,sesion_key,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    _email_from_token(_tok), symbol, direccion,
+                    round(float(ind["precio"]), 6),
+                    entrada.strftime("%H:%M:%S"), entrada.isoformat(),
+                    exp_min, 1 if req.otc else 0,
+                    sesion_act["key"] if sesion_act else None,
+                    datetime.now(TIMEZONE).isoformat(),
+                ))
+        except Exception as _e:
+            print(f"[LW] No se pudo grabar señal: {_e}")
+
         return JSONResponse({
             "ok": True,
             "estado": "SEÑAL",
@@ -427,6 +480,25 @@ def analizar_mercado(req: AnalisisRequest, _tok: str = Depends(_verificar_token)
         else:
             mins = (5 - (ahora.minute % 5)) % 5 or 5
             entrada = ahora + timedelta(minutes=mins)
+        try:
+            sesion_act = _get_sesion_actual()
+            with _db_conn() as conn:
+                conn.execute("""
+                    INSERT INTO web_signals
+                    (user_email,symbol,direction,entry_price,entry_time,entry_dt,
+                     expiration_min,otc,sesion_key,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    _email_from_token(_tok), symbol, dir_otc,
+                    round(float(ind["precio"]), 6),
+                    entrada.strftime("%H:%M:%S"), entrada.isoformat(),
+                    exp_min, 1,
+                    sesion_act["key"] if sesion_act else None,
+                    datetime.now(TIMEZONE).isoformat(),
+                ))
+        except Exception as _e:
+            print(f"[LW] No se pudo grabar señal OTC: {_e}")
+
         return JSONResponse({
             "ok": True,
             "estado": "SEÑAL",
@@ -454,6 +526,95 @@ def analizar_mercado(req: AnalisisRequest, _tok: str = Depends(_verificar_token)
         "lean": lean,
         "condiciones": condiciones,
         "indicadores": _ind_bloque(inc_macd=True),
+    })
+
+
+# ── Verificación automática de señales ───────────────────────────────────────
+
+async def _verificar_señales_loop():
+    """Tarea asyncio: cada 60 s verifica señales web cuya expiración ya pasó."""
+    await _asyncio.sleep(10)   # esperar a que el servidor arranque por completo
+    while True:
+        try:
+            ahora = datetime.now(TIMEZONE)
+            with _db_conn() as conn:
+                pendientes = conn.execute(
+                    "SELECT id, symbol, direction, entry_price, entry_dt, expiration_min "
+                    "FROM web_signals WHERE resultado IS NULL"
+                ).fetchall()
+            for row in pendientes:
+                sig_id, symbol, direction, entry_price, entry_dt_str, exp_min = row
+                try:
+                    entry_dt  = datetime.fromisoformat(entry_dt_str)
+                    verify_at = entry_dt + timedelta(minutes=exp_min + 1)  # 1 min de margen
+                    if ahora < verify_at:
+                        continue
+                    intervalo = "1min" if exp_min == 1 else "5min"
+                    df, err = _obtener_df(symbol, intervalo)
+                    if err or df is None:
+                        continue
+                    close_price = float(df.iloc[-1]["close"])
+                    if direction == "CALL":
+                        resultado = "ITM" if close_price > float(entry_price) else "OTM"
+                    else:
+                        resultado = "ITM" if close_price < float(entry_price) else "OTM"
+                    with _db_conn() as conn:
+                        conn.execute(
+                            "UPDATE web_signals SET resultado=?, close_price=?, verified_at=? WHERE id=?",
+                            (resultado, close_price, ahora.isoformat(), sig_id)
+                        )
+                    print(f"[LW-Results] {symbol} {direction} → {resultado} "
+                          f"(entrada:{entry_price:.5f} cierre:{close_price:.5f})")
+                except Exception as e:
+                    print(f"[LW-Results] Error en señal {sig_id}: {e}")
+        except Exception as e:
+            print(f"[LW-Results] Error general: {e}")
+        await _asyncio.sleep(60)
+
+
+# ── Endpoint de resultados ────────────────────────────────────────────────────
+@app.get("/api/results")
+def api_results(_tok: str = Depends(_verificar_token)):
+    """Retorna métricas de señales web: total, ganadas, perdidas, winrate y últimas señales."""
+    with _db_conn() as conn:
+        row = conn.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN resultado = 'ITM' THEN 1 ELSE 0 END) AS ganadas,
+                SUM(CASE WHEN resultado = 'OTM' THEN 1 ELSE 0 END) AS perdidas
+            FROM web_signals WHERE resultado IS NOT NULL
+        """).fetchone()
+        recientes = conn.execute("""
+            SELECT symbol, direction, entry_price, close_price, resultado,
+                   sesion_key, expiration_min, otc, entry_dt
+            FROM web_signals WHERE resultado IS NOT NULL
+            ORDER BY verified_at DESC LIMIT 20
+        """).fetchall()
+        pendientes = conn.execute("""
+            SELECT symbol, direction, entry_dt, expiration_min, sesion_key
+            FROM web_signals WHERE resultado IS NULL
+            ORDER BY entry_dt DESC LIMIT 5
+        """).fetchall()
+    total   = row[0] or 0
+    ganadas = row[1] or 0
+    perdidas= row[2] or 0
+    winrate = round(ganadas / total * 100, 1) if total > 0 else 0.0
+    return JSONResponse({
+        "total":    total,
+        "ganadas":  ganadas,
+        "perdidas": perdidas,
+        "winrate":  winrate,
+        "recientes": [
+            {"symbol": r[0], "direction": r[1], "entry_price": r[2],
+             "close_price": r[3], "resultado": r[4], "sesion": r[5],
+             "exp_min": r[6], "otc": bool(r[7]), "entry_dt": r[8]}
+            for r in recientes
+        ],
+        "pendientes": [
+            {"symbol": p[0], "direction": p[1], "entry_dt": p[2],
+             "exp_min": p[3], "sesion": p[4]}
+            for p in pendientes
+        ],
     })
 
 
@@ -1040,6 +1201,27 @@ async def index():
     .tag-sesion  { background: rgba(34,197,94,.12);  color: var(--green);  border: 1px solid rgba(34,197,94,.3); }
     .tag-binance { background: rgba(245,158,11,.15); color: var(--gold);   border: 1px solid rgba(245,158,11,.4); }
 
+    /* ═══ RESULTADOS EN VIVO ═══ */
+    .results-live-hdr { display:flex; justify-content:space-between; align-items:center;
+      margin:16px 0 10px; }
+    .results-live-title { font-family:'Orbitron',sans-serif; font-size:10px; color:var(--cyan);
+      font-weight:700; letter-spacing:.5px; }
+    .btn-refresh-res { font-size:10px; padding:5px 12px; border-radius:7px; border:none;
+      background:rgba(0,242,254,.1); color:var(--cyan); cursor:pointer; font-weight:600;
+      transition:opacity .15s; }
+    .btn-refresh-res:hover { opacity:.8; }
+    .result-row { display:flex; align-items:center; justify-content:space-between;
+      padding:9px 12px; border-radius:10px; margin-bottom:6px;
+      background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.07); }
+    .rr-left { flex:1; min-width:0; }
+    .rr-symbol { font-size:13px; font-weight:700; color:#e2e8f0; }
+    .rr-meta { font-size:10px; color:var(--muted); margin-top:2px; }
+    .rr-badge { padding:4px 10px; border-radius:7px; font-size:11px; font-weight:800; flex-shrink:0; }
+    .rr-badge.itm  { background:rgba(34,197,94,.12); color:#4ade80; border:1px solid rgba(34,197,94,.28); }
+    .rr-badge.otm  { background:rgba(239,68,68,.12);  color:#f87171; border:1px solid rgba(239,68,68,.28); }
+    .rr-badge.pend { background:rgba(234,179,8,.10);  color:#fbbf24; border:1px solid rgba(234,179,8,.25); }
+    .results-empty { text-align:center; padding:28px 0; font-size:12px; color:var(--muted); line-height:1.6; }
+
     /* ═══ SECCIÓN RESULTADOS ═══ */
     .winrate-banner {
       background: linear-gradient(135deg, rgba(34,197,94,.12), rgba(0,242,254,.08));
@@ -1492,23 +1674,32 @@ async def index():
       <div class="section-title">🏆 Resultados L&W</div>
 
       <div class="winrate-banner">
-        <div class="wr-number">73%</div>
-        <div class="wr-label">Win Rate promedio · Últimas 4 semanas</div>
+        <div class="wr-number" id="wr-num">—</div>
+        <div class="wr-label" id="wr-label">Cargando resultados...</div>
       </div>
 
       <div class="stats-row">
         <div class="stat-cell">
-          <div class="stat-val" style="color:var(--green)">142</div>
+          <div class="stat-val" id="stat-ganadas" style="color:var(--green)">—</div>
           <div class="stat-lbl">Señales<br>ganadas</div>
         </div>
         <div class="stat-cell">
-          <div class="stat-val" style="color:var(--red)">53</div>
+          <div class="stat-val" id="stat-perdidas" style="color:var(--red)">—</div>
           <div class="stat-lbl">Señales<br>perdidas</div>
         </div>
         <div class="stat-cell">
-          <div class="stat-val" style="color:var(--cyan)">195</div>
+          <div class="stat-val" id="stat-total" style="color:var(--cyan)">—</div>
           <div class="stat-lbl">Total<br>señales</div>
         </div>
+      </div>
+
+      <!-- Historial de señales en vivo -->
+      <div class="results-live-hdr">
+        <div class="results-live-title">📋 HISTORIAL EN VIVO</div>
+        <button class="btn-refresh-res" onclick="loadResults()">↻ Actualizar</button>
+      </div>
+      <div id="results-history">
+        <div class="results-empty">Cargando señales...</div>
       </div>
 
       <div class="testimony-card">
@@ -1729,6 +1920,70 @@ async def index():
       document.getElementById('nav-' + t).classList.toggle('active', t === name);
     });
     document.querySelector('.content-area').scrollTop = 0;
+    if (name === 'resultados') loadResults();
+  }
+
+  /* ── Resultados en vivo ── */
+  async function loadResults() {
+    try {
+      const resp = await fetch('/api/results', { headers: apiHeaders() });
+      if (resp.status === 401) { handle401(); return; }
+      if (!resp.ok) return;
+      const d = await resp.json();
+
+      const wnEl = document.getElementById('wr-num');
+      const wlEl = document.getElementById('wr-label');
+      const ganEl  = document.getElementById('stat-ganadas');
+      const perdEl = document.getElementById('stat-perdidas');
+      const totEl  = document.getElementById('stat-total');
+      if (wnEl)  wnEl.textContent  = d.winrate + '%';
+      if (wlEl)  wlEl.textContent  = 'Win Rate · ' + d.total + ' señales verificadas';
+      if (ganEl)  ganEl.textContent  = d.ganadas;
+      if (perdEl) perdEl.textContent = d.perdidas;
+      if (totEl)  totEl.textContent  = d.total;
+
+      renderResultsHistory(d);
+    } catch (e) { console.error('[LW] loadResults:', e); }
+  }
+
+  function renderResultsHistory(d) {
+    const el = document.getElementById('results-history');
+    if (!el) return;
+    const rows = [
+      ...(d.pendientes || []).map(p => ({...p, resultado:'PENDING'})),
+      ...(d.recientes  || []),
+    ].slice(0, 18);
+
+    if (rows.length === 0) {
+      el.innerHTML = '<div class="results-empty">Sin señales registradas aún.<br>'
+        + 'Usa el Escáner durante una sesión activa<br>para ver los resultados aquí.</div>';
+      return;
+    }
+    el.innerHTML = rows.map(r => {
+      const isPend = r.resultado === 'PENDING';
+      const isITM  = r.resultado === 'ITM';
+      const dirTxt = r.direction === 'CALL' ? '↑ CALL' : '↓ PUT';
+      const dirClr = r.direction === 'CALL' ? '#4ade80' : '#f87171';
+      const badge  = isPend
+        ? '<span class="rr-badge pend">⏳ Verificando</span>'
+        : isITM
+          ? '<span class="rr-badge itm">✅ ITM WIN</span>'
+          : '<span class="rr-badge otm">❌ OTM LOSS</span>';
+      const meta = [
+        r.sesion  || '',
+        r.otc     ? 'OTC'    : '',
+        r.exp_min ? 'M' + r.exp_min : '',
+        (!isPend && r.entry_price && r.close_price)
+          ? (r.entry_price.toFixed ? r.entry_price.toFixed(5) : r.entry_price) + ' → ' + (r.close_price.toFixed ? r.close_price.toFixed(5) : r.close_price)
+          : '',
+      ].filter(Boolean).join(' · ');
+      return '<div class="result-row">'
+        + '<div class="rr-left">'
+        +   '<div class="rr-symbol">' + (r.symbol || '—')
+        +     ' <span style="font-size:11px;color:' + dirClr + '">' + dirTxt + '</span></div>'
+        +   '<div class="rr-meta">' + meta + '</div>'
+        + '</div>' + badge + '</div>';
+    }).join('');
   }
 
   /* ── Scanner sub-pantallas ── */
