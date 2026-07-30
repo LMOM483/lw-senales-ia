@@ -134,6 +134,31 @@ def api_logout(token: str = Depends(_verificar_token)):
         conn.execute("UPDATE users SET session_token = NULL WHERE session_token = ?", (token,))
     return JSONResponse({"ok": True})
 
+# ── Sesiones oficiales L&W ───────────────────────────────────────────────────
+_SESIONES_LW = [
+    {"key": "europa",   "nombre": "EUROPA GOLD",     "inicio": 6,  "fin": 10, "otc": False},
+    {"key": "ny",       "nombre": "NY POWER",         "inicio": 10, "fin": 13, "otc": False},
+    {"key": "overlap",  "nombre": "OVERLAP L&W",      "inicio": 13, "fin": 17, "otc": False},
+    {"key": "otcnight", "nombre": "OTC NIGHT MASTER", "inicio": 19, "fin": 23, "otc": True},
+]
+MAX_SEÑALES_SESION = 5
+
+def _get_sesion_actual():
+    """Devuelve la sesión activa (dict) según hora Brasil (UTC-3), o None si fuera de sesión."""
+    hora = datetime.now(TIMEZONE).hour
+    for s in _SESIONES_LW:
+        if s["inicio"] <= hora < s["fin"]:
+            return s
+    return None
+
+def _get_siguiente_sesion():
+    """Devuelve la próxima sesión programada tras la hora actual."""
+    hora = datetime.now(TIMEZONE).hour
+    for s in _SESIONES_LW:
+        if s["inicio"] > hora:
+            return s
+    return _SESIONES_LW[0]  # primera sesión del día siguiente
+
 # ── Función de datos (sync, reutiliza la misma lógica del bot) ───────────────
 
 _IND_VACIO = {"rsi": None, "stoch_k": None, "stoch_d": None, "tendencia": "—", "macd": None}
@@ -432,13 +457,33 @@ def analizar_mercado(req: AnalisisRequest, _tok: str = Depends(_verificar_token)
     })
 
 
+# ── Endpoint de estado de sesión ─────────────────────────────────────────────
+@app.get("/api/session-info")
+def api_session_info(_tok: str = Depends(_verificar_token)):
+    """Devuelve sesión activa, siguiente sesión y máx señales."""
+    sesion    = _get_sesion_actual()
+    siguiente = _get_siguiente_sesion() if not sesion else None
+    return JSONResponse({
+        "sesion_activa":   sesion,
+        "siguiente_sesion": siguiente,
+        "max_señales":      MAX_SEÑALES_SESION,
+    })
+
+
 # ── Endpoint Escáner de mejores activos ──────────────────────────────────────
 _scanner_cache: dict = {}   # intervalo → {"ts": float, "data": list}
 
 @app.get("/api/top-assets")
 def top_assets(intervalo: str = "5min", otc: bool = False, _tok: str = Depends(_verificar_token)):
     """Escanea todos los activos del pool y los devuelve ordenados por confluencia.
-    Cache de 60 s para no saturar Twelve Data."""
+    Fuera de sesiones oficiales bloquea el escaneo para no consumir créditos de Twelve Data."""
+    # ── Bloqueo fuera de sesión (optimización de API) ──
+    sesion_activa = _get_sesion_actual()
+    if not sesion_activa:
+        return JSONResponse({
+            "status": "outside_session",
+            "siguiente": _get_siguiente_sesion(),
+        })
     ahora_ts = datetime.now().timestamp()
     cached = _scanner_cache.get(intervalo)
     if cached and ahora_ts - cached["ts"] < 30:
@@ -772,6 +817,34 @@ async def index():
     .wait-conditions li:last-child { border-bottom: none; }
     .wait-conditions li::before { content: '▸'; position: absolute; left: 0; color: #eab308; font-size: 10px; top: 6px; }
     .wait-conditions li.lateral-bullet::before { color: var(--muted); }
+
+    /* ══ SESSION CARD ══ */
+    .session-card {
+      padding: 11px 14px; border-radius: 13px; margin-bottom: 10px;
+      background: rgba(168,85,247,.07); border: 1px solid rgba(168,85,247,.28);
+    }
+    .session-card-inner { display:flex; justify-content:space-between; align-items:center; }
+    .session-name { font-family:'Orbitron',sans-serif; font-size:11px; font-weight:700;
+      color:var(--purple); letter-spacing:.5px; }
+    .session-hours { font-size:9px; color:var(--muted); margin-top:2px; letter-spacing:.3px; }
+    .session-counter { text-align:right; }
+    .sc-num { font-family:'Orbitron',sans-serif; font-size:18px; font-weight:900; color:var(--cyan); line-height:1; }
+    .sc-num.warn   { color:var(--yellow); }
+    .sc-num.danger { color:var(--red); }
+    .sc-num.empty  { color:rgba(148,163,184,.35); }
+    .sc-lbl { font-size:9px; color:var(--muted); text-transform:uppercase; letter-spacing:.8px; margin-top:2px; }
+
+    /* ══ OUTSIDE SESSION BANNER ══ */
+    .outside-session-banner {
+      display:none; align-items:center; gap:13px;
+      padding:18px 16px; border-radius:14px; margin-bottom:14px;
+      background:rgba(148,163,184,.04); border:1px solid rgba(148,163,184,.15);
+    }
+    .outside-session-banner.visible { display:flex; }
+    .osb-icon { font-size:30px; flex-shrink:0; }
+    .osb-title { font-family:'Orbitron',sans-serif; font-size:11px; color:var(--muted);
+      font-weight:700; letter-spacing:.5px; }
+    .osb-next { font-size:11px; color:rgba(148,163,184,.6); margin-top:4px; line-height:1.5; }
 
     .error-msg {
       display: none; margin-top: 14px; padding: 13px 15px; border-radius: 11px;
@@ -1144,6 +1217,29 @@ async def index():
             <button class="otc-btn otc"         id="btn-market-otc"  onclick="setOtcMode(true)">🌙 OTC</button>
           </div>
           <div class="otc-banner" id="otc-banner">🌙 MODO OTC</div>
+        </div>
+
+        <!-- Tarjeta de sesión activa + contador de señales -->
+        <div id="session-card" class="session-card" style="display:none">
+          <div class="session-card-inner">
+            <div>
+              <div class="session-name" id="session-name">—</div>
+              <div class="session-hours" id="session-hours">—</div>
+            </div>
+            <div class="session-counter">
+              <div class="sc-num" id="sc-num">5/5</div>
+              <div class="sc-lbl">señales</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Banner fuera de sesión -->
+        <div id="outside-session-banner" class="outside-session-banner">
+          <div class="osb-icon">🌙</div>
+          <div>
+            <div class="osb-title">FUERA DE SESIÓN</div>
+            <div class="osb-next" id="osb-next">Calculando próxima sesión...</div>
+          </div>
         </div>
 
         <!-- 🔥 MEJOR OPORTUNIDAD ACTUAL (se rellena dinámicamente) -->
@@ -1672,6 +1768,13 @@ async def index():
 
       if (data.estado === 'SEÑAL') {
         renderSignal(data);
+        // Descontar 1 señal del cupo de la sesión activa
+        const ses = _sesionActualLocal();
+        if (ses) {
+          const left = _useSignal(ses.key);
+          updateSessionCard();
+          if (left <= 0) _stopHomeTimers();
+        }
       } else if (data.estado === 'ESPERAR' || data.estado === 'LATERAL') {
         renderEsperar(data);
       } else {
@@ -1773,6 +1876,95 @@ async def index():
     scanHome();
   }
 
+  /* ── Sesiones oficiales (espejo del backend) ── */
+  const SESIONES_LW = [
+    {key:'europa',   nombre:'EUROPA GOLD',     inicio:6,  fin:10, otc:false},
+    {key:'ny',       nombre:'NY POWER',         inicio:10, fin:13, otc:false},
+    {key:'overlap',  nombre:'OVERLAP L&W',      inicio:13, fin:17, otc:false},
+    {key:'otcnight', nombre:'OTC NIGHT MASTER', inicio:19, fin:23, otc:true},
+  ];
+  const MAX_SEÑALES = 5;
+
+  function _horasBrasil() {
+    const ahora = new Date();
+    const utc = ahora.getTime() + ahora.getTimezoneOffset() * 60000;
+    return new Date(utc - 3 * 3600000);
+  }
+  function _sesionActualLocal() {
+    const h = _horasBrasil().getHours();
+    return SESIONES_LW.find(s => h >= s.inicio && h < s.fin) || null;
+  }
+  function _siguienteSesionLocal() {
+    const h = _horasBrasil().getHours();
+    return SESIONES_LW.find(s => s.inicio > h) || SESIONES_LW[0];
+  }
+  function _sigCounterKey(key) {
+    const hoy = _horasBrasil().toISOString().slice(0, 10);
+    return 'lw_sig_' + key + '_' + hoy;
+  }
+  function _getSignalsLeft(key) {
+    const v = parseInt(localStorage.getItem(_sigCounterKey(key)));
+    return isNaN(v) ? MAX_SEÑALES : v;
+  }
+  function _useSignal(key) {
+    const left = Math.max(0, _getSignalsLeft(key) - 1);
+    localStorage.setItem(_sigCounterKey(key), left);
+    return left;
+  }
+
+  /* Actualiza la tarjeta de sesión y retorna true si hay sesión activa con señales disponibles */
+  function updateSessionCard() {
+    const sesion    = _sesionActualLocal();
+    const cardEl    = document.getElementById('session-card');
+    const outsideEl = document.getElementById('outside-session-banner');
+
+    if (!sesion) {
+      const sig = _siguienteSesionLocal();
+      if (cardEl)    cardEl.style.display = 'none';
+      if (outsideEl) {
+        outsideEl.classList.add('visible');
+        const nextEl = document.getElementById('osb-next');
+        if (nextEl) nextEl.textContent =
+          'Próxima sesión: ' + sig.nombre + ' · ' + sig.inicio + ':00 – ' + sig.fin + ':00 hs (Brasil)';
+      }
+      document.getElementById('home-loading').style.display = 'none';
+      document.getElementById('home-asset-list').style.display = 'none';
+      document.getElementById('home-best-opp').innerHTML = '';
+      return false;
+    }
+
+    // Hay sesión activa
+    if (outsideEl) outsideEl.classList.remove('visible');
+    if (cardEl)    cardEl.style.display = 'block';
+
+    const left = _getSignalsLeft(sesion.key);
+    const scNum = document.getElementById('sc-num');
+    if (scNum) {
+      scNum.textContent = left + '/' + MAX_SEÑALES;
+      scNum.className = 'sc-num' + (left <= 0 ? ' empty' : left === 1 ? ' danger' : left <= 2 ? ' warn' : '');
+    }
+    const nameEl  = document.getElementById('session-name');
+    const hoursEl = document.getElementById('session-hours');
+    if (nameEl)  nameEl.textContent  = sesion.nombre;
+    if (hoursEl) hoursEl.textContent = sesion.inicio + ':00 – ' + sesion.fin + ':00 hs (Brasil)';
+
+    // Sincronizar modo OTC con la sesión
+    if (sesion.otc !== _otcMode) setOtcMode(sesion.otc);
+
+    if (left <= 0) {
+      const sig = _siguienteSesionLocal();
+      if (outsideEl) {
+        outsideEl.classList.add('visible');
+        const nextEl = document.getElementById('osb-next');
+        if (nextEl) nextEl.textContent =
+          '✅ Cupo agotado en esta sesión · Próxima: ' + sig.nombre + ' (' + sig.inicio + ':00)';
+      }
+      document.getElementById('home-loading').style.display = 'none';
+      return false;
+    }
+    return true;
+  }
+
   function setHomeTime(t) {
     _homeTime = t;
     document.getElementById('home-btn-m5').classList.toggle('active', t === 'M5');
@@ -1784,9 +1976,14 @@ async def index():
 
   function startScannerHome() {
     _stopHomeTimers();
+    const active = updateSessionCard();
+    if (!active) return;    // fuera de sesión o sin señales — no iniciar polling
     scanHome();
-    // Auto-refresh cada 30 s
-    _homeTimer = setInterval(scanHome, 30000);
+    // Auto-refresh cada 30 s, verificando sesión en cada ciclo
+    _homeTimer = setInterval(() => {
+      const still = updateSessionCard();
+      if (still) scanHome(); else _stopHomeTimers();
+    }, 30000);
   }
 
   function _stopHomeTimers() {
@@ -1819,6 +2016,12 @@ async def index():
       if (resp.status === 401) { handle401(); return; }
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       const data = await resp.json();
+      if (data.status === 'outside_session') {
+        // El backend confirmó que estamos fuera de sesión — actualizar UI y detener polling
+        updateSessionCard();
+        _stopHomeTimers();
+        return;
+      }
       if (data.status === 'success') {
         try { renderBestOpp(data.top_assets); } catch(re) { console.error('[LW] renderBestOpp:', re); }
         try { renderHomeAssets(data.top_assets); } catch(re) { console.error('[LW] renderHomeAssets:', re); }
