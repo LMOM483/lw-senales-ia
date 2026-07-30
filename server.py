@@ -61,6 +61,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 class AnalisisRequest(BaseModel):
     symbol: str
     temporalidad: str
+    otc: bool = False
 
 class LoginRequest(BaseModel):
     email: str
@@ -382,6 +383,37 @@ def analizar_mercado(req: AnalisisRequest, _tok: str = Depends(_verificar_token)
             "temporalidad": temporalidad,
             "motivo": _construir_motivo(ind, direccion, metodo),
             "indicadores": _ind_bloque(),
+            "otc": req.otc,
+        })
+
+    # 3b. OTC fallback: si tendencia + MACD alineados, generar señal parcial de menor confianza
+    if req.otc and ind["tendencia"] and ind["macd"] == ind["tendencia"]:
+        dir_otc = ind["tendencia"]
+        # Confianza base OTC: 60-68% según RSI
+        rsi_otc = ind["rsi"]
+        conf_otc = 65.0
+        if dir_otc == "CALL" and 50 <= rsi_otc <= 70:
+            conf_otc = 68.0
+        elif dir_otc == "PUT" and 30 <= rsi_otc <= 50:
+            conf_otc = 68.0
+        ahora = datetime.now(TIMEZONE)
+        if temporalidad == "M1":
+            entrada = ahora.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        else:
+            mins = (5 - (ahora.minute % 5)) % 5 or 5
+            entrada = ahora + timedelta(minutes=mins)
+        return JSONResponse({
+            "ok": True,
+            "estado": "SEÑAL",
+            "direccion": dir_otc,
+            "confianza": round(conf_otc, 1),
+            "entrada": entrada.strftime("%H:%M:%S"),
+            "expiracion": exp_min,
+            "activo": symbol,
+            "temporalidad": temporalidad,
+            "motivo": "Señal OTC · " + _construir_motivo(ind, dir_otc, "tendencia+MACD"),
+            "indicadores": _ind_bloque(),
+            "otc": True,
         })
 
     # 4. Sin señal: explicar qué falta
@@ -404,7 +436,7 @@ def analizar_mercado(req: AnalisisRequest, _tok: str = Depends(_verificar_token)
 _scanner_cache: dict = {}   # intervalo → {"ts": float, "data": list}
 
 @app.get("/api/top-assets")
-def top_assets(intervalo: str = "5min", _tok: str = Depends(_verificar_token)):
+def top_assets(intervalo: str = "5min", otc: bool = False, _tok: str = Depends(_verificar_token)):
     """Escanea todos los activos del pool y los devuelve ordenados por confluencia.
     Cache de 60 s para no saturar Twelve Data."""
     ahora_ts = datetime.now().timestamp()
@@ -470,8 +502,9 @@ def top_assets(intervalo: str = "5min", _tok: str = Depends(_verificar_token)):
                 score += 15
                 partes.append("Estocástico cruzó a la baja")
 
-            if score >= 45 and dir_t:
-                label  = "🟡 SEÑAL EN FORMACIÓN"
+            otc_min = 30 if otc else 45
+            if score >= otc_min and dir_t:
+                label  = "🟡 SEÑAL EN FORMACIÓN" + (" · OTC" if otc else "")
                 signal = dir_t
             else:
                 label  = "⚪ MERCADO LATERAL"
@@ -484,6 +517,7 @@ def top_assets(intervalo: str = "5min", _tok: str = Depends(_verificar_token)):
                 "confirmed": False,   # no llegó a 4/4 capas
                 "status_label": label,
                 "reason": " + ".join(partes) if partes else "Sin confluencia técnica",
+                "otc": otc,
             })
         except Exception:
             continue
@@ -757,6 +791,26 @@ async def index():
     .time-toggle-btn { padding:5px 13px; font-size:11px; font-weight:600; border:none;
       cursor:pointer; background:transparent; color:rgba(148,163,184,.55); transition:all .15s; }
     .time-toggle-btn.active { background:var(--purple); color:#fff; }
+
+    /* ══ OTC MARKET TOGGLE ══ */
+    .otc-row { display:flex; align-items:center; gap:8px; padding:9px 0 10px;
+      border-bottom:1px solid rgba(255,255,255,.06); margin-bottom:8px; }
+    .otc-row-label { font-size:9px; color:var(--muted); letter-spacing:.8px;
+      text-transform:uppercase; flex-shrink:0; }
+    .otc-toggle { display:flex; border-radius:8px; overflow:hidden;
+      border:1px solid rgba(255,255,255,.1); flex-shrink:0; }
+    .otc-btn { padding:5px 12px; font-size:10px; font-weight:600; border:none;
+      cursor:pointer; background:transparent; color:rgba(148,163,184,.55); transition:all .15s; }
+    .otc-btn.real.active { background:var(--purple); color:#fff; }
+    .otc-btn.otc.active  { background:linear-gradient(135deg,#92400e,var(--gold)); color:#fff; }
+    .otc-banner { display:none; margin-left:auto; padding:4px 10px; border-radius:7px;
+      font-size:9px; font-weight:700; letter-spacing:.6px; color:var(--gold);
+      background:rgba(245,158,11,.1); border:1px solid rgba(245,158,11,.3); }
+    .otc-banner.visible { display:block; }
+    .otc-signal-badge { display:inline-block; padding:4px 10px; border-radius:7px;
+      font-size:10px; font-weight:700; letter-spacing:.8px;
+      background:rgba(245,158,11,.12); color:var(--gold);
+      border:1px solid rgba(245,158,11,.3); margin-bottom:10px; }
 
     /* Best opp — señal confirmada */
     .boc-wrap { border-radius:15px; overflow:hidden; margin-bottom:14px; }
@@ -1080,6 +1134,16 @@ async def index():
             <button class="time-toggle-btn active" id="home-btn-m5" onclick="setHomeTime('M5')">M5</button>
             <button class="time-toggle-btn" id="home-btn-m1" onclick="setHomeTime('M1')">M1</button>
           </div>
+        </div>
+
+        <!-- Toggle Mercado Real / OTC -->
+        <div class="otc-row">
+          <span class="otc-row-label">Mercado:</span>
+          <div class="otc-toggle">
+            <button class="otc-btn real active" id="btn-market-real" onclick="setOtcMode(false)">📈 Real</button>
+            <button class="otc-btn otc"         id="btn-market-otc"  onclick="setOtcMode(true)">🌙 OTC</button>
+          </div>
+          <div class="otc-banner" id="otc-banner">🌙 MODO OTC</div>
         </div>
 
         <!-- 🔥 MEJOR OPORTUNIDAD ACTUAL (se rellena dinámicamente) -->
@@ -1523,7 +1587,9 @@ async def index():
   }
 
   function enterApp() {
-    document.getElementById('screen-login').classList.remove('active');
+    const loginEl = document.getElementById('screen-login');
+    loginEl.classList.remove('active');
+    loginEl.style.display = 'none';          // fuerza ocultamiento aunque haya inline style previo
     document.getElementById('bottom-nav').classList.add('visible');
     switchTab('bot');
     startScannerHome();
@@ -1533,7 +1599,9 @@ async def index():
     const TABS_ALL = ['bot', 'academia', 'resultados', 'soporte'];
     TABS_ALL.forEach(t => document.getElementById('tab-' + t).classList.remove('active'));
     document.getElementById('bottom-nav').classList.remove('visible');
-    document.getElementById('screen-login').classList.add('active');
+    const loginEl = document.getElementById('screen-login');
+    loginEl.style.display = '';              // limpia inline style para que el CSS tome control
+    loginEl.classList.add('active');
     if (msg) {
       const errEl = document.getElementById('login-error');
       errEl.textContent   = msg;
@@ -1588,13 +1656,14 @@ async def index():
   /* ── Análisis on-demand (desde home o desde cualquier activo) ── */
   async function startAnalysis(symbol, temporalidad) {
     if (!symbol || !temporalidad) return;
+    const symbolClean = symbol.replace(' (OTC)', '').trim();  // quitar sufijo OTC antes de enviar a la API
     resetSignal();
     showScanner('scanner-signal');
     try {
       const resp = await fetch('/api/analizar', {
         method: 'POST',
         headers: apiHeaders(),
-        body: JSON.stringify({ symbol, temporalidad }),
+        body: JSON.stringify({ symbol: symbolClean, temporalidad, otc: _otcMode }),
       });
       if (resp.status === 401) { handle401(); return; }
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -1629,9 +1698,19 @@ async def index():
     const isCall = d.direccion === 'CALL';
     const ind    = d.indicadores || {};
     card.className = 'signal-card ' + (isCall ? 'signal-call' : 'signal-put');
+    // Badge OTC si aplica
+    const existingBadge = card.querySelector('.otc-signal-badge');
+    if (existingBadge) existingBadge.remove();
+    if (d.otc) {
+      const badge = document.createElement('div');
+      badge.className = 'otc-signal-badge';
+      badge.textContent = '🌙 SESIÓN OTC · Alta Volatilidad';
+      card.insertBefore(badge, card.firstChild);
+    }
     document.getElementById('sig-direction').textContent =
       isCall ? '🟢 COMPRA (CALL)  ↑' : '🔴 VENTA (PUT)  ↓';
-    document.getElementById('sig-pair').textContent    = (d.activo || '') + ' · ' + (d.temporalidad || '');
+    const pairSuffix = d.otc ? ' (OTC)' : '';
+    document.getElementById('sig-pair').textContent    = (d.activo || '') + pairSuffix + ' · ' + (d.temporalidad || '');
     document.getElementById('sig-entrada').textContent = d.entrada || '--:--:--';
     document.getElementById('sig-exp').textContent     = (d.expiracion != null ? d.expiracion : '--') + ' min';
     document.getElementById('sig-rsi').textContent     = formatNum(ind.rsi);
@@ -1682,6 +1761,17 @@ async def index():
   let _homeTimer     = null;      // setInterval del auto-refresh (30 s)
   let _homeCountdown = null;      // setInterval del contador visual
   let _homeNextScan  = 0;         // timestamp del próximo escaneo
+  let _otcMode       = false;     // modo Mercado OTC
+
+  function setOtcMode(isOtc) {
+    _otcMode = isOtc;
+    document.getElementById('btn-market-real').classList.toggle('active', !isOtc);
+    document.getElementById('btn-market-otc').classList.toggle('active',  isOtc);
+    const banner = document.getElementById('otc-banner');
+    if (banner) banner.classList.toggle('visible', isOtc);
+    _stopHomeTimers();
+    scanHome();
+  }
 
   function setHomeTime(t) {
     _homeTime = t;
@@ -1724,7 +1814,7 @@ async def index():
     if (infoEl) infoEl.textContent = 'Escaneando... · ' + _homeTime;
 
     try {
-      const resp = await fetch('/api/top-assets?intervalo=' + intervalo,
+      const resp = await fetch('/api/top-assets?intervalo=' + intervalo + '&otc=' + _otcMode,
                                { headers: apiHeaders() });
       if (resp.status === 401) { handle401(); return; }
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -1767,12 +1857,13 @@ async def index():
     const cls    = isCall ? 'call' : 'put';
     const dir    = isCall ? '🟢 CALL — COMPRA ↑' : '🔴 PUT — VENTA ↓';
     const conf   = best.confluence != null ? Number(best.confluence).toFixed(0) + '%' : '—';
+    const symLabel = (best.symbol || '') + (_otcMode ? ' (OTC)' : '');
     el.innerHTML =
       '<div class="boc-wrap ' + cls + '">' +
-        '<div class="boc-lbl">🔥 MEJOR OPORTUNIDAD ACTUAL</div>' +
+        '<div class="boc-lbl">' + (_otcMode ? '🌙 MEJOR OPP. OTC' : '🔥 MEJOR OPORTUNIDAD ACTUAL') + '</div>' +
         '<div class="boc-dir ' + cls + '">' + dir + '</div>' +
         '<div class="boc-meta">' +
-          '<span>' + (best.symbol || '') + ' · ' + _homeTime + '</span>' +
+          '<span>' + symLabel + ' · ' + _homeTime + '</span>' +
           '<span class="boc-conf ' + cls + '">' + conf + ' confluencia</span>' +
         '</div>' +
         '<div class="boc-reason">' + (best.reason || '') + '</div>' +
@@ -1817,9 +1908,10 @@ async def index():
       const pill = document.createElement('div');
       pill.className = 'home-pill';
       pill.setAttribute('data-symbol', a.symbol || '');
+      const dispSymbol = (a.symbol || '') + (_otcMode ? ' (OTC)' : '');
       pill.innerHTML =
         '<div class="hp-left">' +
-          '<div class="hp-symbol">' + (a.symbol || '') + '</div>' +
+          '<div class="hp-symbol">' + dispSymbol + '</div>' +
           '<div class="hp-reason">' + (a.reason || '') + '</div>' +
         '</div>' +
         '<div class="hp-right">' +
