@@ -269,6 +269,19 @@ def api_activate_key(req: ActivateKeyRequest):
     return JSONResponse({"ok": True, "token": token, "expires_at": expires_at_str})
 
 
+@app.get("/api/me")
+def api_me(x_session_token: str = Header(None)):
+    """Retorna si la sesión actual pertenece a un usuario admin (tabla users) o VIP (licenses)."""
+    if not x_session_token:
+        return JSONResponse({"is_admin": False})
+    with _db_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM users WHERE session_token = ? AND is_active = 1",
+            (x_session_token,)
+        ).fetchone()
+    return JSONResponse({"is_admin": bool(row)})
+
+
 @app.post("/api/heartbeat")
 def api_heartbeat(x_session_token: str = Header(None)):
     """Ping de sesión activa — permite contar usuarios en línea en el panel admin."""
@@ -380,6 +393,14 @@ def admin_extend_key(key: str, _tok: str = Depends(_verify_admin)):
             (new_exp, lic_id),
         )
     return JSONResponse({"ok": True, "new_expires_at": new_exp})
+
+
+@app.delete("/admin/api/reset-history")
+def admin_reset_history(_tok: str = Depends(_verify_admin)):
+    """Elimina todo el historial de señales web para empezar medición limpia."""
+    with _db_conn() as conn:
+        conn.execute("DELETE FROM web_signals")
+    return JSONResponse({"ok": True, "message": "Historial reiniciado a 0."})
 
 
 @app.get("/admin/api/stats")
@@ -664,8 +685,27 @@ def analizar_mercado(req: AnalisisRequest, _tok: str = Depends(_verificar_token)
     resultados = evaluar_estrategias(df)
 
     if resultados:
-        # ── ESTADO: SEÑAL CONFIRMADA ──────────────────────────────────────────
+        # ── ESTADO: SEÑAL CONFIRMADA (4/4 capas) ─────────────────────────────
         direccion, confianza, metodo = resultados[0]
+
+        # ── Filtro OTC estricto: RSI en zona extrema ──────────────────────────
+        if req.otc:
+            rsi_val = float(ind["rsi"])
+            otc_ok  = (direccion == "CALL" and rsi_val < 20) or \
+                      (direccion == "PUT"  and rsi_val > 80)
+            if not otc_ok:
+                return JSONResponse({
+                    "ok": True,
+                    "estado": "ESPERAR",
+                    "lean": direccion,
+                    "condiciones": [
+                        f"Señal {direccion} detectada (4/4 capas), pero RSI={rsi_val:.1f} no cumple el filtro OTC estricto.",
+                        f"OTC exige RSI < 20 para CALL (sobreventa extrema) o RSI > 80 para PUT (sobrecompra extrema).",
+                        f"Espera que el RSI alcance esa zona antes de entrar. Alta probabilidad de reversión.",
+                    ],
+                    "indicadores": _ind_bloque(inc_macd=True),
+                })
+
         ahora = datetime.now(TIMEZONE)
         if temporalidad == "M1":
             entrada = ahora.replace(second=0, microsecond=0) + timedelta(minutes=1)
@@ -707,56 +747,7 @@ def analizar_mercado(req: AnalisisRequest, _tok: str = Depends(_verificar_token)
             "otc": req.otc,
         })
 
-    # 3b. OTC fallback: si tendencia + MACD alineados, generar señal parcial de menor confianza
-    if req.otc and ind["tendencia"] and ind["macd"] == ind["tendencia"]:
-        dir_otc = ind["tendencia"]
-        # Confianza base OTC: 60-68% según RSI
-        rsi_otc = ind["rsi"]
-        conf_otc = 65.0
-        if dir_otc == "CALL" and 50 <= rsi_otc <= 70:
-            conf_otc = 68.0
-        elif dir_otc == "PUT" and 30 <= rsi_otc <= 50:
-            conf_otc = 68.0
-        ahora = datetime.now(TIMEZONE)
-        if temporalidad == "M1":
-            entrada = ahora.replace(second=0, microsecond=0) + timedelta(minutes=1)
-        else:
-            mins = (5 - (ahora.minute % 5)) % 5 or 5
-            entrada = ahora + timedelta(minutes=mins)
-        try:
-            sesion_act = _get_sesion_actual()
-            with _db_conn() as conn:
-                conn.execute("""
-                    INSERT INTO web_signals
-                    (user_email,symbol,direction,entry_price,entry_time,entry_dt,
-                     expiration_min,otc,sesion_key,created_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    _email_from_token(_tok), symbol, dir_otc,
-                    round(float(ind["precio"]), 6),
-                    entrada.strftime("%H:%M:%S"), entrada.isoformat(),
-                    exp_min, 1,
-                    sesion_act["key"] if sesion_act else None,
-                    datetime.now(TIMEZONE).isoformat(),
-                ))
-        except Exception as _e:
-            print(f"[LW] No se pudo grabar señal OTC: {_e}")
-
-        return JSONResponse({
-            "ok": True,
-            "estado": "SEÑAL",
-            "direccion": dir_otc,
-            "confianza": round(conf_otc, 1),
-            "entrada": entrada.strftime("%H:%M:%S"),
-            "expiracion": exp_min,
-            "activo": symbol,
-            "temporalidad": temporalidad,
-            "motivo": "Señal OTC · " + _construir_motivo(ind, dir_otc, "tendencia+MACD"),
-            "indicadores": _ind_bloque(),
-            "otc": True,
-        })
-
-    # 4. Sin señal: explicar qué falta
+    # 4. Sin señal confirmada (4/4 capas no superadas): explicar qué falta
     condiciones, estado = _que_esperar(ind)
 
     lean = None
@@ -1105,12 +1096,18 @@ async def admin_page():
       </div>
     </div>
 
-    <!-- Generate key -->
+    <!-- Generate key + Reset history -->
     <div class="card">
       <div class="section-title">⚡ GENERAR LLAVE VIP</div>
       <button class="btn btn-gold" id="btn-gen" onclick="generateKey()">
         + Generar Llave VIP (30 Días)
       </button>
+      <button class="btn btn-sm btn-danger" id="btn-reset"
+              onclick="resetHistory()"
+              style="margin-top:10px;padding:10px 20px;font-size:11px;">
+        🗑️ Reiniciar Historial de Resultados a 0
+      </button>
+
       <div class="new-key-box" id="new-key-box">
         <div style="font-size:10px;color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:1px;">
           ✅ Nueva Llave Generada — Lista para copiar
@@ -1313,6 +1310,24 @@ async def admin_page():
       const data = await resp.json();
       if (data.ok) { await loadLicenses(); }
     } catch (e) { alert('Error al extender la llave.'); }
+  }
+
+  async function resetHistory() {
+    if (!confirm('¿Reiniciar el historial de resultados a 0?\nEsta acción es irreversible y borrará todas las señales registradas.')) return;
+    const btn = document.getElementById('btn-reset');
+    if (btn) { btn.disabled = true; btn.textContent = 'Reiniciando...'; }
+    try {
+      const resp = await fetch('/admin/api/reset-history', {method: 'DELETE', headers: adminHeaders()});
+      if (resp.status === 403) { adminLogout(); return; }
+      const data = await resp.json();
+      if (data.ok) {
+        alert('Historial reiniciado a 0. La medición comienza desde cero.');
+        await loadStats();
+      }
+    } catch (e) { alert('Error al reiniciar historial.'); }
+    finally {
+      if (btn) { btn.disabled = false; btn.textContent = '🗑️ Reiniciar Historial de Resultados a 0'; }
+    }
   }
 
   // Auto-login si hay token guardado en localStorage
@@ -2419,6 +2434,19 @@ async def index():
         Las señales son análisis técnicos automatizados, no asesoría financiera.
       </div>
 
+      <!-- Botón Panel Admin (solo visible para Lina) -->
+      <div id="admin-btn-wrap" style="display:none;margin-bottom:12px;">
+        <a href="/admin" target="_blank"
+           style="display:block;width:100%;padding:14px;border:none;border-radius:12px;
+                  font-family:'Orbitron',sans-serif;font-size:12px;font-weight:700;
+                  letter-spacing:1px;color:#fff;cursor:pointer;text-align:center;
+                  text-decoration:none;
+                  background:linear-gradient(135deg,#b45309,var(--gold));
+                  box-shadow:0 0 20px rgba(245,158,11,.3);">
+          ⚙️ Panel de Licencias / Admin
+        </a>
+      </div>
+
       <button class="btn btn-secondary" onclick="doLogout()"
               style="width:100%;font-size:12px;padding:11px;">
         🚪 Cerrar sesión
@@ -2516,6 +2544,18 @@ async def index():
     switchTab('bot');
     startScannerHome();
     startHeartbeat();
+    checkAdminAccess();
+  }
+
+  /* ── Detecta si el usuario es admin y muestra el botón del panel ── */
+  async function checkAdminAccess() {
+    try {
+      const resp = await fetch('/api/me', { headers: apiHeaders() });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const wrap = document.getElementById('admin-btn-wrap');
+      if (wrap) wrap.style.display = data.is_admin ? '' : 'none';
+    } catch (_) {}
   }
 
   function showLogin(msg) {
